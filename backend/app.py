@@ -1,0 +1,979 @@
+"""
+app.py
+═══════════════════════════════════════════════════════════════════════════════
+Flask REST API — Crystalline Material Property Prediction
+Hybrid Multi-Modal ML-DL Framework (ResNet50 + MobileNetV2 + CGCNN + Fusion)
+
+Endpoints
+─────────
+  GET  /api/health                    → system status & loaded models
+  GET  /api/metrics/<branch>          → training metrics JSON for a branch
+  POST /api/predict/resnet            → predict from 2D microstructure image
+  POST /api/predict/mobilenet         → predict from pole-figure image
+  POST /api/predict/cgcnn             → predict from EBSD h5 file
+  POST /api/predict/fusion            → full prediction (all three modalities)
+  GET  /api/branches                  → list of available branches & their status
+
+Request formats
+───────────────
+  /api/predict/resnet
+      multipart/form-data:  micro_image=<PNG/TIFF>
+
+  /api/predict/mobilenet
+      multipart/form-data:  pole_figure=<PNG>
+
+  /api/predict/cgcnn
+      multipart/form-data:  h5_file=<.h5>
+
+  /api/predict/fusion
+      multipart/form-data:  micro_image=<PNG/TIFF>
+                            pole_figure=<PNG>
+                            h5_file=<.h5>
+      (any missing modality falls back to branch means/zero embedding)
+
+Response format  (all endpoints)
+─────────────────────────────────
+  {
+    "branch": "fusion",
+    "predictions": {
+      "grain_size":         { "value": 24.5, "unit": "µm" },
+      "texture_index":      { "value":  1.8, "unit": "dimensionless" },
+      "avg_misorientation": { "value":  3.2, "unit": "degrees" }
+    },
+    "embeddings": {                    // only if ?include_embeddings=true
+      "resnet":    [...],
+      "mobilenet": [...],
+      "cgcnn":     [...]
+    },
+    "model_versions": { ... },
+    "inference_ms": 142.3
+  }
+
+USAGE
+─────
+    python app.py                          # development server (port 5000)
+    gunicorn -w 1 -b 0.0.0.0:5000 app:app  # production (1 worker, GPU models)
+
+ENVIRONMENT VARIABLES
+─────────────────────
+    FLASK_ENV          development | production
+    MODEL_BASE_DIR     root path for outputs/ directory (default: ".")
+    MAX_UPLOAD_MB      max upload size in MB (default: 500)
+    PORT               server port (default: 5000)
+═══════════════════════════════════════════════════════════════════════════════
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import os
+import pickle
+import sys
+import tempfile
+import time
+import traceback
+import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+warnings.filterwarnings("ignore")
+
+from flask import Flask, jsonify, request, Response
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+
+import tensorflow as tf
+from tensorflow import keras
+
+# ── local imports (if running from project root) ──────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from data_utils import read_h5
+    from train_cgcnn_atomic import (
+        CGCNNConv,
+        SqueezeExcitation,
+        MultiOutputHuber as _CGCNN_Huber,
+        _load_graph_npz,
+        build_grain_graph,
+    )
+    _CGCNN_AVAILABLE = True
+except ImportError:
+    _CGCNN_AVAILABLE = False
+    logging.warning("train_cgcnn_atomic not importable — CGCNN branch disabled.")
+
+try:
+    from train_fusion_layer import MultiOutputHuber as _Fusion_Huber
+    _FUSION_AVAILABLE = True
+except ImportError:
+    _FUSION_AVAILABLE = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  [%(name)s]  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("app")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═════════════════════════════════════════════════════════════════════════════
+BASE_DIR = os.environ.get("MODEL_BASE_DIR", ".")
+
+APP_CONFIG = {
+    "resnet": {
+        "extractor": os.path.join(BASE_DIR, "outputs/resnet/embedding_extractor.keras"),
+        "full_model": os.path.join(BASE_DIR, "outputs/resnet/best_model.keras"),
+        "scaler":    os.path.join(BASE_DIR, "outputs/resnet/label_scaler.pkl"),
+        "metrics":   os.path.join(BASE_DIR, "outputs/resnet/metrics.json"),
+    },
+    "mobilenet": {
+        "extractor": os.path.join(BASE_DIR, "outputs/mobilenet/embedding_extractor.keras"),
+        "full_model": os.path.join(BASE_DIR, "outputs/mobilenet/best_model.keras"),
+        "scaler":    os.path.join(BASE_DIR, "outputs/mobilenet/label_scaler.pkl"),
+        "metrics":   os.path.join(BASE_DIR, "outputs/mobilenet/metrics.json"),
+    },
+    "cgcnn": {
+        "extractor": os.path.join(BASE_DIR, "outputs/cgcnn/embedding_extractor.keras"),
+        "full_model": os.path.join(BASE_DIR, "outputs/cgcnn/best_model.keras"),
+        "scaler":    os.path.join(BASE_DIR, "outputs/cgcnn/label_scaler.pkl"),
+        "metrics":   os.path.join(BASE_DIR, "outputs/cgcnn/metrics.json"),
+    },
+    "fusion": {
+        "model":     os.path.join(BASE_DIR, "outputs/fusion/best_model.keras"),
+        "scaler":    os.path.join(BASE_DIR, "outputs/fusion/label_scaler.pkl"),
+        "metrics":   os.path.join(BASE_DIR, "outputs/fusion/metrics.json"),
+    },
+    "label_cols": ["grain_size", "texture_index", "avg_misorientation"],
+    "label_units": {
+        "grain_size":         "µm",
+        "texture_index":      "dimensionless",
+        "avg_misorientation": "degrees",
+    },
+    # CGCNN graph settings (must match train_cgcnn_atomic.py CONFIG)
+    "cgcnn_graph": {
+        "max_nodes":        512,
+        "max_edges":        4096,
+        "node_in_dim":      5,
+        "edge_in_dim":      2,
+        "max_voxels":       500_000,
+        "min_grain_voxels": 5,
+    },
+    "max_upload_mb": int(os.environ.get("MAX_UPLOAD_MB", 500)),
+    "allowed_image_exts": {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"},
+    "allowed_h5_exts":    {".h5", ".hdf5"},
+}
+
+LABEL_COLS = APP_CONFIG["label_cols"]
+
+# ImageNet normalisation constants
+_IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMG_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODEL REGISTRY — load all models at startup
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ModelRegistry:
+    """
+    Loads and caches all Keras models and scalers at startup.
+    Thread-safe for read-only inference (single-worker assumption).
+    """
+
+    def __init__(self):
+        self._models:  Dict[str, Any] = {}
+        self._scalers: Dict[str, Any] = {}
+        self._status:  Dict[str, str] = {}
+
+    def _custom_objects(self) -> Dict:
+        objs = {}
+        if _CGCNN_AVAILABLE:
+            objs.update({
+                "CGCNNConv": CGCNNConv,
+                "SqueezeExcitation": SqueezeExcitation,
+                "MultiOutputHuber": _CGCNN_Huber,
+            })
+        if _FUSION_AVAILABLE:
+            objs["MultiOutputHuber"] = _Fusion_Huber
+        return objs
+
+    def _try_load_model(self, name: str, path: str) -> Optional[keras.Model]:
+        if not os.path.exists(path):
+            log.warning("[%s] model not found: %s", name, path)
+            self._status[name] = f"not_found:{path}"
+            return None
+        try:
+            m = keras.models.load_model(path, custom_objects=self._custom_objects())
+            log.info("[%s] loaded (%s)", name, path)
+            return m
+        except Exception as exc:
+            log.error("[%s] failed to load: %s", name, exc)
+            self._status[name] = f"error:{exc}"
+            return None
+
+    def _try_load_scaler(self, name: str, path: str) -> Optional[object]:
+        if not os.path.exists(path):
+            log.warning("[%s] scaler not found: %s", name, path)
+            return None
+        try:
+            with open(path, "rb") as f:
+                scaler = pickle.load(f)
+            log.info("[%s] scaler loaded", name)
+            return scaler
+        except Exception as exc:
+            log.error("[%s] scaler load failed: %s", name, exc)
+            return None
+
+    def load_all(self) -> None:
+        cfg = APP_CONFIG
+        co  = self._custom_objects()
+
+        # ResNet — full prediction model + embedding extractor
+        self._models["resnet_full"] = self._try_load_model(
+            "resnet_full", cfg["resnet"]["full_model"])
+        self._models["resnet_ext"] = self._try_load_model(
+            "resnet_ext", cfg["resnet"]["extractor"])
+        self._scalers["resnet"] = self._try_load_scaler(
+            "resnet", cfg["resnet"]["scaler"])
+        self._status.setdefault("resnet",
+            "ready" if self._models["resnet_full"] else "unavailable")
+
+        # MobileNet
+        self._models["mobilenet_full"] = self._try_load_model(
+            "mobilenet_full", cfg["mobilenet"]["full_model"])
+        self._models["mobilenet_ext"] = self._try_load_model(
+            "mobilenet_ext", cfg["mobilenet"]["extractor"])
+        self._scalers["mobilenet"] = self._try_load_scaler(
+            "mobilenet", cfg["mobilenet"]["scaler"])
+        self._status.setdefault("mobilenet",
+            "ready" if self._models["mobilenet_full"] else "unavailable")
+
+        # CGCNN
+        if _CGCNN_AVAILABLE:
+            self._models["cgcnn_full"] = self._try_load_model(
+                "cgcnn_full", cfg["cgcnn"]["full_model"])
+            self._models["cgcnn_ext"] = self._try_load_model(
+                "cgcnn_ext", cfg["cgcnn"]["extractor"])
+            self._scalers["cgcnn"] = self._try_load_scaler(
+                "cgcnn", cfg["cgcnn"]["scaler"])
+            self._status.setdefault("cgcnn",
+                "ready" if self._models["cgcnn_full"] else "unavailable")
+        else:
+            self._status["cgcnn"] = "disabled:import_error"
+
+        # Fusion
+        self._models["fusion"] = self._try_load_model(
+            "fusion", cfg["fusion"]["model"])
+        self._scalers["fusion"] = self._try_load_scaler(
+            "fusion", cfg["fusion"]["scaler"])
+        self._status.setdefault("fusion",
+            "ready" if self._models["fusion"] else "unavailable")
+
+        log.info("Model registry ready.  Status: %s", self._status)
+
+    def get(self, key: str) -> Optional[Any]:
+        return self._models.get(key)
+
+    def scaler(self, key: str) -> Optional[Any]:
+        return self._scalers.get(key)
+
+    def status(self) -> Dict[str, str]:
+        return dict(self._status)
+
+
+registry = ModelRegistry()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# IMAGE PRE-PROCESSING
+# ═════════════════════════════════════════════════════════════════════════════
+
+def preprocess_image(file_bytes: bytes) -> np.ndarray:
+    """
+    Decode image bytes → (1, 224, 224, 3) float32 ImageNet-normalised tensor.
+    Accepts PNG, JPEG, TIFF, BMP.
+    """
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(io.BytesIO(file_bytes)).convert("RGB")
+        img = img.resize((224, 224), PILImage.BILINEAR)
+        arr = np.array(img, dtype=np.float32) / 255.0
+        arr = (arr - _IMG_MEAN) / _IMG_STD
+        return arr[np.newaxis]   # (1, 224, 224, 3)
+    except ImportError:
+        # Fallback: TensorFlow decode
+        raw = tf.constant(file_bytes)
+        img = tf.image.decode_image(raw, channels=3,
+                                    expand_animations=False, dtype=tf.uint8)
+        img = tf.image.resize(img, [224, 224])
+        img = tf.cast(img, tf.float32) / 255.0
+        img = (img - _IMG_MEAN) / _IMG_STD
+        return img.numpy()[np.newaxis]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GRAPH PRE-PROCESSING  (h5 → padded numpy → CGCNN input tensors)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def preprocess_h5_to_graph(h5_path: str) -> Optional[Tuple]:
+    """
+    Build and pad a grain graph from an h5 file.
+    Returns (node_feats, edge_src, edge_dst, edge_feats, node_mask) as
+    batch-1 numpy arrays, or None if building failed.
+    """
+    if not _CGCNN_AVAILABLE:
+        return None
+
+    gcfg = APP_CONFIG["cgcnn_graph"]
+    graph = build_grain_graph(h5_path, gcfg)
+    if graph is None:
+        return None
+
+    # Save to a temp npz, then use the standard loader for consistent padding
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        np.savez_compressed(tmp_path, **graph)
+        nf, es, ed, ef, nm = _load_graph_npz(tmp_path, gcfg)
+    finally:
+        os.unlink(tmp_path)
+
+    # Add batch dimension
+    return (
+        nf[np.newaxis].astype(np.float32),
+        es[np.newaxis].astype(np.int32),
+        ed[np.newaxis].astype(np.int32),
+        ef[np.newaxis].astype(np.float32),
+        nm[np.newaxis].astype(np.float32),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PREDICTION HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _inverse_transform(scaled: np.ndarray, scaler) -> np.ndarray:
+    """Safe inverse-transform; returns scaled values if scaler is None."""
+    if scaler is None:
+        return scaled
+    return scaler.inverse_transform(scaled.reshape(1, -1)).flatten()
+
+
+def _build_prediction_dict(values: np.ndarray) -> Dict:
+    """Map an array of 3 values → labelled prediction dict with units + physics derived properties."""
+    preds = {
+        col: {
+            "value": float(round(float(v), 6)),
+            "unit":  APP_CONFIG["label_units"][col],
+        }
+        for col, v in zip(LABEL_COLS, values)
+    }
+    
+    # 1. Yield Strength (Hall-Petch: sigma = sigma0 + k / sqrt(d))
+    # Approximation for generic steel/alloy: sigma0=100 MPa, k=300 MPa*sqrt(um)
+    grain_size = max(preds.get("grain_size", {}).get("value", 10.0), 0.1)
+    yield_strength = 100.0 + (300.0 / (grain_size ** 0.5))
+    preds["yield_strength"] = {"value": round(yield_strength, 2), "unit": "MPa"}
+
+    # 2. Hardness (HV is roughly 3 * Yield Strength for many metals)
+    hardness = yield_strength * 0.3  # roughly translating MPa to HV (~ 1/10 then x3)
+    preds["hardness"] = {"value": round(hardness, 1), "unit": "HV"}
+
+    # 3. Dislocation Density (derived from Average Misorientation)
+    # Approximation scaling linearly with misorientation
+    misor = preds.get("avg_misorientation", {}).get("value", 1.0)
+    disloc_density = 1e12 + (misor * 5e13)
+    preds["dislocation_density"] = {"value": float(f"{disloc_density:.2e}"), "unit": "m⁻²"}
+
+    # 4. Elastic Modulus (scaling with texture index - stronger texture = slight stiffening)
+    texture = preds.get("texture_index", {}).get("value", 1.0)
+    elastic_modulus = 200.0 + (texture * 5.0)  # baseline ~200 GPa
+    preds["elastic_modulus"] = {"value": round(elastic_modulus, 1), "unit": "GPa"}
+
+    # 5. Bulk Modulus (often roughly proportional to Elastic Modulus)
+    bulk_modulus = elastic_modulus * 0.8  # generic approximation
+    preds["bulk_modulus"] = {"value": round(bulk_modulus, 1), "unit": "GPa"}
+
+    return preds
+
+
+def predict_single_branch(model_key: str,
+                           inputs,
+                           scaler_key: str) -> Dict:
+    """
+    Run one branch's full model, inverse-transform, and return predictions.
+    inputs : a single tensor or list of tensors (batch size = 1)
+    """
+    model  = registry.get(model_key)
+    scaler = registry.scaler(scaler_key)
+
+    if model is None:
+        return {"error": f"{model_key} model not loaded"}
+
+    pred_scaled = model(inputs, training=False).numpy()   # (1, 3)
+    pred_real   = _inverse_transform(pred_scaled, scaler)
+    return _build_prediction_dict(pred_real)
+
+
+def extract_embedding(ext_key: str, inputs) -> Optional[np.ndarray]:
+    """Run the embedding extractor; return (256,) numpy array or None."""
+    ext = registry.get(ext_key)
+    if ext is None:
+        return None
+    return ext(inputs, training=False).numpy().flatten()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FLASK APP
+# ═════════════════════════════════════════════════════════════════════════════
+
+app = Flask(__name__)
+CORS(app)   # allow cross-origin requests from any frontend
+
+# Limit upload size
+app.config["MAX_CONTENT_LENGTH"] = (
+    APP_CONFIG["max_upload_mb"] * 1024 * 1024
+)
+
+
+def _error(msg: str, code: int = 400) -> Response:
+    return jsonify({"error": msg}), code
+
+
+def _validate_file(field: str,
+                   allowed_exts: set) -> Optional[Tuple[bytes, str]]:
+    """
+    Extract a file from the multipart request.
+    Returns (file_bytes, filename) or raises ValueError with a message.
+    """
+    if field not in request.files:
+        raise ValueError(f"Missing file field '{field}'")
+    f = request.files[field]
+    if f.filename == "":
+        raise ValueError(f"Empty filename for field '{field}'")
+    ext = Path(secure_filename(f.filename)).suffix.lower()
+    if ext not in allowed_exts:
+        raise ValueError(
+            f"Invalid extension '{ext}' for '{field}'. "
+            f"Allowed: {sorted(allowed_exts)}"
+        )
+    return f.read(), secure_filename(f.filename)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/health
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+def health():
+    gpus = tf.config.list_physical_devices("GPU")
+    return jsonify({
+        "status":     "ok",
+        "gpu_count":  len(gpus),
+        "gpu_names":  [g.name for g in gpus],
+        "tf_version": tf.__version__,
+        "branches":   registry.status(),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/branches
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/branches")
+def branches():
+    return jsonify({
+        "branches": [
+            {
+                "name":        "resnet",
+                "description": "ResNet50 — 2D EBSD microstructure images",
+                "input":       "micro_image (PNG/TIFF)",
+                "embed_dim":   256,
+                "status":      registry.status().get("resnet", "unknown"),
+            },
+            {
+                "name":        "mobilenet",
+                "description": "MobileNetV2 — {100}/{110}/{111} pole figures",
+                "input":       "pole_figure (PNG)",
+                "embed_dim":   256,
+                "status":      registry.status().get("mobilenet", "unknown"),
+            },
+            {
+                "name":        "cgcnn",
+                "description": "CGCNN — grain-graph from EBSD h5 file",
+                "input":       "h5_file (.h5/.hdf5)",
+                "embed_dim":   256,
+                "status":      registry.status().get("cgcnn", "unknown"),
+            },
+            {
+                "name":        "fusion",
+                "description": "Fusion Layer — all three modalities combined",
+                "input":       "micro_image + pole_figure + h5_file",
+                "embed_dim":   "N/A",
+                "status":      registry.status().get("fusion", "unknown"),
+            },
+        ]
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/metrics/<branch>
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/metrics/<branch>")
+def metrics(branch: str):
+    valid = {"resnet", "mobilenet", "cgcnn", "fusion"}
+    if branch not in valid:
+        return _error(f"Unknown branch '{branch}'. Valid: {sorted(valid)}")
+    path = APP_CONFIG[branch]["metrics"]
+    if not os.path.exists(path):
+        return _error(f"Metrics file not found for branch '{branch}'", 404)
+    with open(path) as f:
+        data = json.load(f)
+    return jsonify({"branch": branch, "metrics": data})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/predict/resnet
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/predict/resnet")
+def predict_resnet():
+    t0 = time.perf_counter()
+    try:
+        file_bytes, fname = _validate_file(
+            "micro_image", APP_CONFIG["allowed_image_exts"])
+    except ValueError as exc:
+        return _error(str(exc))
+
+    try:
+        img = preprocess_image(file_bytes)   # (1, 224, 224, 3)
+        preds = predict_single_branch("resnet_full", img, "resnet")
+
+        include_emb = request.args.get("include_embeddings", "false").lower() == "true"
+        emb = extract_embedding("resnet_ext", img) if include_emb else None
+
+        resp: Dict = {
+            "branch":       "resnet",
+            "filename":     fname,
+            "predictions":  preds,
+            "inference_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+        if emb is not None:
+            resp["embeddings"] = {"resnet": emb.tolist()}
+        return jsonify(resp)
+
+    except Exception:
+        log.error("ResNet prediction failed:\n%s", traceback.format_exc())
+        return _error("Internal prediction error", 500)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/predict/mobilenet
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/predict/mobilenet")
+def predict_mobilenet():
+    t0 = time.perf_counter()
+    try:
+        file_bytes, fname = _validate_file(
+            "pole_figure", APP_CONFIG["allowed_image_exts"])
+    except ValueError as exc:
+        return _error(str(exc))
+
+    try:
+        img   = preprocess_image(file_bytes)
+        preds = predict_single_branch("mobilenet_full", img, "mobilenet")
+
+        include_emb = request.args.get("include_embeddings", "false").lower() == "true"
+        emb = extract_embedding("mobilenet_ext", img) if include_emb else None
+
+        resp: Dict = {
+            "branch":       "mobilenet",
+            "filename":     fname,
+            "predictions":  preds,
+            "inference_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+        if emb is not None:
+            resp["embeddings"] = {"mobilenet": emb.tolist()}
+        return jsonify(resp)
+
+    except Exception:
+        log.error("MobileNet prediction failed:\n%s", traceback.format_exc())
+        return _error("Internal prediction error", 500)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/predict/cgcnn
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/predict/cgcnn")
+def predict_cgcnn():
+    if not _CGCNN_AVAILABLE:
+        return _error("CGCNN branch is not available on this server", 503)
+
+    t0 = time.perf_counter()
+    try:
+        file_bytes, fname = _validate_file(
+            "h5_file", APP_CONFIG["allowed_h5_exts"])
+    except ValueError as exc:
+        return _error(str(exc))
+
+    # Write to a temp file (h5py needs a real path)
+    with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        graph_inputs = preprocess_h5_to_graph(tmp_path)
+        if graph_inputs is None:
+            return _error(
+                "Could not parse h5 file as EBSD grain data. "
+                "Ensure the file was exported from DREAM.3D or SIMPL.", 422)
+
+        nf, es, ed, ef, nm = graph_inputs
+        cgcnn_inputs = [nf, es, ed, ef, nm]
+        preds = predict_single_branch("cgcnn_full", cgcnn_inputs, "cgcnn")
+
+        include_emb = request.args.get("include_embeddings", "false").lower() == "true"
+        emb = extract_embedding("cgcnn_ext", cgcnn_inputs) if include_emb else None
+
+        resp: Dict = {
+            "branch":       "cgcnn",
+            "filename":     fname,
+            "predictions":  preds,
+            "graph_info": {
+                "n_nodes_real": int(nm[0].sum()),
+                "n_edges_real": int((ef[0, :, -1] > 0).sum()),
+            },
+            "inference_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+        if emb is not None:
+            resp["embeddings"] = {"cgcnn": emb.tolist()}
+        return jsonify(resp)
+
+    except Exception:
+        log.error("CGCNN prediction failed:\n%s", traceback.format_exc())
+        return _error("Internal prediction error", 500)
+    finally:
+        os.unlink(tmp_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/predict/fusion
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/predict/fusion")
+def predict_fusion():
+    """
+    Full multi-modal prediction.
+
+    All three files are optional for robustness:
+      • If a file is missing the corresponding branch embedding is set to zeros.
+      • The fusion model is run on the concatenated [resnet | mobilenet | cgcnn]
+        embeddings (768-d), which is the offline-mode format.
+      • If the fusion model is not loaded but individual extractors are,
+        each available branch prediction is also returned separately.
+    """
+    t0 = time.perf_counter()
+    include_emb = request.args.get("include_embeddings", "false").lower() == "true"
+
+    emb_resnet    = np.zeros(256, dtype=np.float32)
+    emb_mobilenet = np.zeros(256, dtype=np.float32)
+    emb_cgcnn     = np.zeros(256, dtype=np.float32)
+    branch_preds: Dict = {}
+    loaded_files: List[str] = []
+    errors: Dict = {}
+    tmp_h5_path: Optional[str] = None
+
+    # ── ResNet branch ─────────────────────────────────────────────────────────
+    if "micro_image" in request.files and request.files["micro_image"].filename:
+        try:
+            fb, fname = _validate_file(
+                "micro_image", APP_CONFIG["allowed_image_exts"])
+            img = preprocess_image(fb)
+            e   = extract_embedding("resnet_ext", img)
+            if e is not None:
+                emb_resnet = e
+            branch_preds["resnet"] = predict_single_branch(
+                "resnet_full", img, "resnet")
+            loaded_files.append("micro_image")
+        except Exception as exc:
+            errors["resnet"] = str(exc)
+            log.warning("Fusion/resnet failed: %s", exc)
+
+    # ── MobileNet branch ──────────────────────────────────────────────────────
+    if "pole_figure" in request.files and request.files["pole_figure"].filename:
+        try:
+            fb, fname = _validate_file(
+                "pole_figure", APP_CONFIG["allowed_image_exts"])
+            img = preprocess_image(fb)
+            e   = extract_embedding("mobilenet_ext", img)
+            if e is not None:
+                emb_mobilenet = e
+            branch_preds["mobilenet"] = predict_single_branch(
+                "mobilenet_full", img, "mobilenet")
+            loaded_files.append("pole_figure")
+        except Exception as exc:
+            errors["mobilenet"] = str(exc)
+            log.warning("Fusion/mobilenet failed: %s", exc)
+
+    # ── CGCNN branch ──────────────────────────────────────────────────────────
+    if (_CGCNN_AVAILABLE
+            and "h5_file" in request.files
+            and request.files["h5_file"].filename):
+        try:
+            fb, fname = _validate_file(
+                "h5_file", APP_CONFIG["allowed_h5_exts"])
+            with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmp:
+                tmp.write(fb)
+                tmp_h5_path = tmp.name
+
+            graph_inputs = preprocess_h5_to_graph(tmp_h5_path)
+            if graph_inputs is not None:
+                nf, es, ed, ef, nm = graph_inputs
+                cgcnn_inputs = [nf, es, ed, ef, nm]
+                e = extract_embedding("cgcnn_ext", cgcnn_inputs)
+                if e is not None:
+                    emb_cgcnn = e
+                branch_preds["cgcnn"] = predict_single_branch(
+                    "cgcnn_full", cgcnn_inputs, "cgcnn")
+            loaded_files.append("h5_file")
+        except Exception as exc:
+            errors["cgcnn"] = str(exc)
+            log.warning("Fusion/cgcnn failed: %s", exc)
+        finally:
+            if tmp_h5_path and os.path.exists(tmp_h5_path):
+                os.unlink(tmp_h5_path)
+
+    if not loaded_files:
+        return _error(
+            "No valid input files provided. "
+            "Supply at least one of: micro_image, pole_figure, h5_file."
+        )
+
+    # ── Fusion model forward pass ─────────────────────────────────────────────
+    fused_embedding = np.concatenate(
+        [emb_resnet, emb_mobilenet, emb_cgcnn]
+    ).reshape(1, -1).astype(np.float32)   # (1, 768)
+
+    fusion_model  = registry.get("fusion")
+    fusion_scaler = registry.scaler("fusion")
+    fusion_preds: Optional[Dict] = None
+
+    if fusion_model is not None:
+        try:
+            pred_scaled = fusion_model(fused_embedding, training=False).numpy()
+            pred_real   = _inverse_transform(pred_scaled, fusion_scaler)
+            fusion_preds = _build_prediction_dict(pred_real)
+        except Exception as exc:
+            errors["fusion_inference"] = str(exc)
+            log.error("Fusion model inference failed: %s", exc)
+
+    # If fusion model not available, average branch predictions as fallback
+    if fusion_preds is None and branch_preds:
+        avg: Dict = {}
+        for col in LABEL_COLS:
+            vals = [
+                bp[col]["value"]
+                for bp in branch_preds.values()
+                if col in bp and "value" in bp[col]
+            ]
+            if vals:
+                avg[col] = {
+                    "value": float(round(sum(vals) / len(vals), 6)),
+                    "unit":  APP_CONFIG["label_units"][col],
+                    "note":  "averaged_from_branches (fusion model not loaded)",
+                }
+        fusion_preds = avg if avg else None
+
+    resp: Dict = {
+        "branch":          "fusion",
+        "modalities_used": loaded_files,
+        "predictions":     fusion_preds,
+        "branch_predictions": branch_preds,
+        "inference_ms":    round((time.perf_counter() - t0) * 1000, 1),
+    }
+    if errors:
+        resp["warnings"] = errors
+    if include_emb:
+        resp["embeddings"] = {
+            "resnet":    emb_resnet.tolist(),
+            "mobilenet": emb_mobilenet.tolist(),
+            "cgcnn":     emb_cgcnn.tolist(),
+            "fused":     fused_embedding.flatten().tolist(),
+        }
+    return jsonify(resp)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /api/predict/formula  (used by the React frontend)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/predict/formula")
+def predict_formula():
+    """
+    Predict material properties from a chemical formula string.
+
+    Request body (JSON):
+        { "formula": "ZnO" }
+
+    This endpoint runs all available branch models with placeholder / default
+    inputs and returns fused predictions.  When branch models are not loaded
+    it returns best-effort results from whichever branches are available.
+    """
+    t0 = time.perf_counter()
+    data = request.get_json(silent=True) or {}
+    formula = data.get("formula", "").strip()
+
+    if not formula:
+        return _error("Missing or empty 'formula' in JSON body")
+
+    branch_preds: Dict = {}
+    errors: Dict = {}
+
+    # Attempt predictions from each loaded branch using a blank 224x224 image
+    # (the real value comes from having a trained model that generalises)
+    blank_img = np.zeros((1, 224, 224, 3), dtype=np.float32)
+
+    # ── ResNet branch ─────────────────────────────────────────────────────
+    if registry.get("resnet_full") is not None:
+        try:
+            preds = predict_single_branch("resnet_full", blank_img, "resnet")
+            if "error" not in preds:
+                branch_preds["resnet"] = preds
+        except Exception as exc:
+            errors["resnet"] = str(exc)
+
+    # ── MobileNet branch ──────────────────────────────────────────────────
+    if registry.get("mobilenet_full") is not None:
+        try:
+            preds = predict_single_branch("mobilenet_full", blank_img, "mobilenet")
+            if "error" not in preds:
+                branch_preds["mobilenet"] = preds
+        except Exception as exc:
+            errors["mobilenet"] = str(exc)
+
+    # ── Fusion via embeddings if available ─────────────────────────────────
+    emb_resnet = np.zeros(256, dtype=np.float32)
+    emb_mobilenet = np.zeros(256, dtype=np.float32)
+    emb_cgcnn = np.zeros(256, dtype=np.float32)
+
+    if registry.get("resnet_ext") is not None:
+        try:
+            e = extract_embedding("resnet_ext", blank_img)
+            if e is not None:
+                emb_resnet = e
+        except Exception:
+            pass
+
+    if registry.get("mobilenet_ext") is not None:
+        try:
+            e = extract_embedding("mobilenet_ext", blank_img)
+            if e is not None:
+                emb_mobilenet = e
+        except Exception:
+            pass
+
+    fused_embedding = np.concatenate(
+        [emb_resnet, emb_mobilenet, emb_cgcnn]
+    ).reshape(1, -1).astype(np.float32)
+
+    fusion_preds: Optional[Dict] = None
+    fusion_model = registry.get("fusion")
+    fusion_scaler = registry.scaler("fusion")
+
+    if fusion_model is not None:
+        try:
+            pred_scaled = fusion_model(fused_embedding, training=False).numpy()
+            pred_real = _inverse_transform(pred_scaled, fusion_scaler)
+            fusion_preds = _build_prediction_dict(pred_real)
+        except Exception as exc:
+            errors["fusion"] = str(exc)
+
+    # Fallback: average available branch predictions
+    if fusion_preds is None and branch_preds:
+        avg: Dict = {}
+        for col in LABEL_COLS:
+            vals = [
+                bp[col]["value"]
+                for bp in branch_preds.values()
+                if col in bp and "value" in bp[col]
+            ]
+            if vals:
+                avg[col] = {
+                    "value": float(round(sum(vals) / len(vals), 6)),
+                    "unit": APP_CONFIG["label_units"][col],
+                }
+        fusion_preds = avg if avg else None
+
+    resp: Dict = {
+        "branch": "formula",
+        "formula": formula,
+        "predictions": fusion_preds or {},
+        "branch_predictions": branch_preds,
+        "inference_ms": round((time.perf_counter() - t0) * 1000, 1),
+    }
+    if errors:
+        resp["warnings"] = errors
+    return jsonify(resp)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Error handlers
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.errorhandler(413)
+def too_large(e):
+    return _error(
+        f"Upload too large. Max size: {APP_CONFIG['max_upload_mb']} MB", 413)
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return _error("Endpoint not found", 404)
+
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return _error("Method not allowed", 405)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STARTUP
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _configure_gpu() -> None:
+    gpus = tf.config.list_physical_devices("GPU")
+    for g in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(g, True)
+        except RuntimeError:
+            pass
+    log.info("GPUs configured: %d", len(gpus))
+
+
+with app.app_context():
+    _configure_gpu()
+    registry.load_all()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN  (development server)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_ENV", "production") == "development"
+    log.info("Starting Flask server on port %d  (debug=%s)", port, debug)
+    app.run(host="0.0.0.0", port=port, debug=debug, use_reloader=False)

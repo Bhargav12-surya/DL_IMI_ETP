@@ -1,0 +1,31 @@
+# Data directory (large datasets, not tracked)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Model weights & checkpoints (large files)
+*.pt
+*.pth
+*.onnx
+runs/

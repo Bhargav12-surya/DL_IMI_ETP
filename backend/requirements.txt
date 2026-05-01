@@ -1,0 +1,42 @@
+# =============================================================================
+# requirements.txt
+# Hybrid Multi-Modal ML-DL Framework
+# Covers ALL branches: ResNet50 + MobileNetV2 + CGCNN + Fusion Layer + Flask API
+# Tested on Python 3.9 / 3.10 / 3.11  +  CUDA 11.8 / 12.x
+# Install with:  pip install -r requirements.txt
+# =============================================================================
+
+# ── Deep Learning ─────────────────────────────────────────────────────────────
+tensorflow>=2.16                  # 2.16+ needed for Python 3.12 support
+# Apple Silicon (M1/M2/M3) — replace the line above with these two:
+#   tensorflow-macos>=2.16
+#   tensorflow-metal>=1.0
+
+# ── Data I/O ──────────────────────────────────────────────────────────────────
+h5py>=3.8.0                     # EBSD / DREAM.3D h5 files
+numpy>=1.23.0                   # TF 2.16+ supports numpy 2.x
+pandas>=1.5.0                   # CSV label management
+Pillow>=9.4.0                   # image decode / pole-figure PNG saving
+
+# ── ML Utilities ──────────────────────────────────────────────────────────────
+scikit-learn>=1.2.0             # StandardScaler, train_test_split, metrics
+
+# ── Scientific Computing ──────────────────────────────────────────────────────
+scipy>=1.9.0                    # gaussian smoothing for pole figures
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.6.0               # training history plots, scatter plots
+
+# ── Progress / CLI ────────────────────────────────────────────────────────────
+tqdm>=4.64.0                    # progress bars during label generation
+
+# ── Web API (Flask) ───────────────────────────────────────────────────────────
+flask>=2.3.0                    # REST API server
+flask-cors>=4.0.0               # cross-origin headers so frontend can connect
+werkzeug>=2.3.0                 # utilities for Flask (file handling, security)
+gunicorn>=21.0.0; sys_platform != 'win32'   # production WSGI server  (Linux / macOS only)
+waitress>=2.1.0                 # production WSGI server  (Windows alternative)
+
+# ── Optional but strongly recommended ────────────────────────────────────────
+# tensorboard>=2.12.0           # already bundled with TF; run: tensorboard --logdir logs/
+# ipykernel                     # only needed if running in Jupyter notebooks
