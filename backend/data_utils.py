@@ -69,6 +69,10 @@ _GRAIN_CANDIDATES = [
     "FeatureIds",
     "GrainIds",
 ]
+_KAM_CANDIDATES = [
+    "Scan 1/EBSD/Data/KAM",
+    "KAM",
+]
 _PHASE_CANDIDATES = [
     "/DataContainers/ImageDataContainer/CellData/Phases",
     "/DataContainers/SyntheticVolumeDataContainer/CellData/Phases",
@@ -119,6 +123,7 @@ def read_h5(path: str) -> Dict[str, Optional[np.ndarray]]:
         with h5py.File(path, "r") as f:
             euler  = _h5_read_first(f, _EULER_CANDIDATES)
             grains = _h5_read_first(f, _GRAIN_CANDIDATES)
+            kam    = _h5_read_first(f, _KAM_CANDIDATES)
             phases = _h5_read_first(f, _PHASE_CANDIDATES)
             dims   = _h5_read_first(f, _DIM_CANDIDATES)
 
@@ -131,12 +136,20 @@ def read_h5(path: str) -> Dict[str, Optional[np.ndarray]]:
 
         if grains is not None:
             grains = grains.flatten().astype(np.int32)
+        if kam is not None:
+            kam = kam.flatten().astype(np.float32)
         if phases is not None:
             phases = phases.flatten().astype(np.int32)
         if dims is not None:
             dims = dims.flatten().astype(np.int32)
 
-        return {"euler": euler, "grains": grains, "phases": phases, "dims": dims}
+        return {
+            "euler":  euler,
+            "grains": grains,
+            "kam":    kam,
+            "phases": phases,
+            "dims":   dims
+        }
 
     except Exception as exc:
         log.debug("Failed to read %s: %s", path, exc)
@@ -310,7 +323,7 @@ def compute_texture_index(euler: np.ndarray, n_bins: int = 36) -> float:
         density=True,
     )
     J = float(np.sum(H ** 2) * (360.0 / n_bins) * (180.0 / n_bins) * (360.0 / n_bins))
-    return J
+    return J * (360.0 * 180.0 * 360.0)
 
 
 def compute_average_misorientation(euler: np.ndarray,
@@ -447,6 +460,9 @@ def generate_labels_csv(h5_dir: str,
                 grain_size = estimate_mean_grain_size(grains, voxel_size_um)
                 if compute_misorientation:
                     avg_misor = compute_average_misorientation(ea, grains)
+            elif data.get("kam") is not None:
+                # Fallback to mean KAM if grain-level misorientation cannot be computed
+                avg_misor = float(np.mean(data["kam"]))
 
             tex_idx = compute_texture_index(ea)
 
@@ -620,7 +636,15 @@ def pair_microstructure_images(labels_df: pd.DataFrame,
     before = len(df)
     df.dropna(subset=["micro_img_path"], inplace=True)
     df.reset_index(drop=True, inplace=True)
+    
     log.info("Microstructure images paired: %d/%d.", len(df), before)
+    
+    if len(df) == 0 and before > 0:
+        log.error("CRITICAL: Zero microstructure images were paired with h5 samples.")
+        log.error("Sample ID example: '%s'", labels_df.iloc[0]["sample_id"])
+        log.error("Available image stems (first 5): %s", [Path(p).stem for p in all_imgs[:5]])
+        log.error("Ensure that 2D EBSD images share the same stem as h5 files.")
+        
     return df
 
 
@@ -648,7 +672,19 @@ def validate_dataset(df: pd.DataFrame,
 
     # Drop NaN labels
     before = len(df)
-    df.dropna(subset=label_cols, inplace=True)
+    
+    # Safety check for empty DF or missing columns to avoid KeyError
+    if df.empty:
+        log.warning("Dataset is empty – skipping NaN drop.")
+    else:
+        existing_cols = [c for c in label_cols if c in df.columns]
+        missing_cols  = [c for c in label_cols if c not in df.columns]
+        if missing_cols:
+            log.warning("Some label columns missing from DataFrame: %s", missing_cols)
+        
+        if existing_cols:
+            df.dropna(subset=existing_cols, inplace=True)
+        
     n_nan = before - len(df)
     if n_nan:
         log.warning("Dropped %d rows with NaN labels.", n_nan)

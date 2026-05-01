@@ -536,10 +536,9 @@ class _StateCallback(keras.callbacks.Callback):
             w.writerow(row)
 
 
-def get_standard_callbacks(cfg: Dict, state: Dict
-                            ) -> List[keras.callbacks.Callback]:
+def get_standard_callbacks(cfg: Dict, state: Dict, lr_scheduler: Optional[Any] = None) -> List[keras.callbacks.Callback]:
     best_path = os.path.join(cfg["ckpt_dir"], "best_model.keras")
-    return [
+    callbacks = [
         keras.callbacks.ModelCheckpoint(
             best_path, monitor="val_loss",
             save_best_only=True, verbose=1,
@@ -548,16 +547,24 @@ def get_standard_callbacks(cfg: Dict, state: Dict
             monitor="val_loss", patience=20,
             restore_best_weights=True, verbose=1,
         ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5,
-            patience=8, min_lr=1e-7, verbose=1,
-        ),
         keras.callbacks.TensorBoard(
             log_dir=cfg["tb_dir"],
             histogram_freq=0, update_freq="epoch",
         ),
         _StateCallback(cfg, state),
     ]
+
+    if lr_scheduler is not None:
+        if isinstance(lr_scheduler, keras.callbacks.Callback):
+            callbacks.insert(2, lr_scheduler)
+        else:
+            callbacks.insert(2, keras.callbacks.LearningRateScheduler(lr_scheduler))
+    else:
+        callbacks.insert(2, keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5,
+            patience=8, min_lr=1e-7, verbose=1,
+        ))
+    return callbacks
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -759,13 +766,20 @@ def main() -> None:
                 model = keras.models.load_model(last_ckpt,
                                                 custom_objects=custom_objs)
             steps_per_epoch = max(1, len(tr_i) // cfg["batch_size"])
-            lr_schedule = keras.optimizers.schedules.CosineDecay(
+            lr_schedule_obj = keras.optimizers.schedules.CosineDecay(
                 initial_learning_rate=cfg["lr_finetune"],
                 decay_steps=steps_per_epoch * cfg["finetune_epochs"],
                 alpha=1e-7,
             )
+
+            def lr_scheduler_fn(epoch, lr):  # noqa: ARG001
+                relative_step = (epoch - cfg["warmup_epochs"]) * steps_per_epoch
+                if relative_step < 0:
+                    return cfg["lr_finetune"]
+                return float(lr_schedule_obj(relative_step))
+
             model.compile(
-                optimizer=_get_optimizer(lr_schedule, cfg),
+                optimizer=_get_optimizer(cfg["lr_finetune"], cfg),
                 loss=MultiOutputHuber(delta=1.0),
                 metrics=["mae"],
             )
@@ -774,7 +788,7 @@ def main() -> None:
                 train_ds, validation_data=val_ds,
                 epochs=total,
                 initial_epoch=done,
-                callbacks=get_standard_callbacks(cfg, state),
+                callbacks=get_standard_callbacks(cfg, state, lr_scheduler=lr_scheduler_fn),
                 verbose=1,
             )
 

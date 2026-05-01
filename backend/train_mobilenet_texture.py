@@ -149,7 +149,6 @@ CONFIG: Dict = {
 
     # ── label targets ─────────────────────────────────────────────────────────
     "label_cols": [
-        "grain_size",           # mean equiv-sphere-diameter  (µm)
         "texture_index",        # ODF second moment  J  (dimensionless)
         "avg_misorientation",   # mean intra-grain misorientation  (°)
     ],
@@ -433,17 +432,36 @@ def build_mobilenet_model(cfg: Dict,
     inp = keras.Input(shape=(*cfg["img_size"], cfg["img_channels"]),
                       name="texture_input")
 
-    backbone = MobileNetV2(
+    backbone_base = MobileNetV2(
         include_top=False,
         weights="imagenet",
-        input_tensor=inp,
         pooling=None,        # we do our own pooling
         alpha=1.0,           # full-width MobileNetV2
     )
+
+    # Create a multi-output model to extract intermediate stages
+    stage_outputs = []
+    for stage in ["s3", "s4", "s5"]:
+        found = False
+        for name in _MOB_STAGE_LAYERS[stage]:
+            try:
+                stage_outputs.append(backbone_base.get_layer(name).output)
+                found = True
+                break
+            except ValueError:
+                continue
+        if not found:
+            raise ValueError(f"Could not find layers for stage {stage}")
+
+    backbone = keras.Model(
+        inputs=backbone_base.input,
+        outputs=stage_outputs,
+        name="mobilenetv2"
+    )
     backbone.trainable = trainable_backbone
 
-    # ── Multi-scale feature extraction ────────────────────────────────────────
-    s3, s4, s5 = _get_mobilenet_stage_outputs(backbone)
+    # Connect backbone to input and get multi-scale features
+    s3, s4, s5 = backbone(inp)
 
     def gap_project(feat, units, name):
         """Global-average-pool → Dense → BN → GELU."""
@@ -497,8 +515,8 @@ class MultiOutputHuber(keras.losses.Loss):
 
     def __init__(self, delta: float = 1.0, **kwargs):
         super().__init__(**kwargs)
-        self._delta = delta
-        self._huber = keras.losses.Huber(delta=delta, reduction="auto")
+        self.delta = delta
+        self._huber = keras.losses.Huber(delta=delta, reduction="sum_over_batch_size")
 
     def call(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         y_true = tf.cast(y_true, tf.float32)
@@ -506,7 +524,7 @@ class MultiOutputHuber(keras.losses.Loss):
         return self._huber(y_true, y_pred)
 
     def get_config(self) -> dict:
-        return {**super().get_config(), "delta": self._delta}
+        return {**super().get_config(), "delta": self.delta}
 
 
 def _get_optimizer(lr, cfg: Dict) -> keras.optimizers.Optimizer:
@@ -639,28 +657,20 @@ class CheckpointAndLogCallback(keras.callbacks.Callback):
             log.warning("CSV write error: %s", exc)
 
 
-def get_standard_callbacks(cfg: Dict, state: Dict) -> List[keras.callbacks.Callback]:
+def get_standard_callbacks(cfg: Dict, state: Dict, lr_scheduler: Optional[Any] = None) -> List[keras.callbacks.Callback]:
     """Return the standard set of callbacks used in both training phases."""
     ckpt_dir = cfg["ckpt_dir"]
     csv_path = os.path.join(cfg["log_dir"], "training_log.csv")
     tb_dir   = cfg["tb_dir"]
 
-    return [
+    callbacks = [
         CheckpointAndLogCallback(ckpt_dir, csv_path, state),
         keras.callbacks.EarlyStopping(
-            monitor            = "val_loss",
-            patience           = 12,
+            monitor              = "val_loss",
+            patience             = 12,
             restore_best_weights = True,
-            verbose            = 1,
-            min_delta          = 1e-5,
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor   = "val_loss",
-            factor    = 0.5,
-            patience  = 5,
-            min_lr    = 1e-8,
-            verbose   = 1,
-            min_delta = 1e-5,
+            verbose              = 1,
+            min_delta            = 1e-5,
         ),
         keras.callbacks.TensorBoard(
             log_dir        = tb_dir,
@@ -668,6 +678,22 @@ def get_standard_callbacks(cfg: Dict, state: Dict) -> List[keras.callbacks.Callb
             update_freq    = "epoch",
         ),
     ]
+
+    if lr_scheduler is not None:
+        if isinstance(lr_scheduler, keras.callbacks.Callback):
+            callbacks.insert(2, lr_scheduler)
+        else:
+            callbacks.insert(2, keras.callbacks.LearningRateScheduler(lr_scheduler))
+    else:
+        callbacks.insert(2, keras.callbacks.ReduceLROnPlateau(
+            monitor   = "val_loss",
+            factor    = 0.5,
+            patience  = 5,
+            min_lr    = 1e-8,
+            verbose   = 1,
+            min_delta = 1e-5,
+        ))
+    return callbacks
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -929,7 +955,7 @@ def main() -> None:  # noqa: C901  (complexity OK for orchestration function)
             model = build_mobilenet_model(cfg, trainable_backbone=False)
             compile_model(model, cfg["lr_warmup"], cfg)
             log.info("MobileNetV2 backbone layer count: %d",
-                     len(model.get_layer("mobilenetv2_1.00_224").layers))
+                     len(model.get_layer("mobilenetv2").layers))
 
         model.summary(expand_nested=False, print_fn=log.info)
         state["phase"] = "warmup"
@@ -976,10 +1002,10 @@ def main() -> None:  # noqa: C901  (complexity OK for orchestration function)
 
         # Unfreeze top ``unfreeze_from`` fraction of backbone
         try:
-            backbone = model.get_layer("mobilenetv2_1.00_224")
+            backbone = model.get_layer("mobilenetv2")
         except ValueError:
-            # Alternative name in some TF versions
-            backbone = model.get_layer("mobilenetv2_1.00_224_1")
+            # Fallback to index if name is somehow mangled
+            backbone = [l for l in model.layers if isinstance(l, keras.Model)][0]
 
         n_layers         = len(backbone.layers)
         unfreeze_idx     = int(n_layers * cfg["unfreeze_from"])
@@ -993,15 +1019,22 @@ def main() -> None:  # noqa: C901  (complexity OK for orchestration function)
 
         state["phase"] = "finetune"
 
-        # Cosine-decay LR schedule over the entire fine-tune phase
+        # Cosine-decay LR schedule via Callback (prevents Keras 3 TypeError)
         steps_per_epoch = max(1, len(tr_i) // cfg["batch_size"])
-        lr_schedule = keras.optimizers.schedules.CosineDecay(
+        lr_schedule_obj = keras.optimizers.schedules.CosineDecay(
             initial_learning_rate = cfg["lr_finetune"],
             decay_steps           = steps_per_epoch * cfg["finetune_epochs"],
             alpha                 = 1e-7,
         )
+
+        def lr_scheduler_fn(epoch, lr):  # noqa: ARG001
+            relative_step = (epoch - cfg["warmup_epochs"]) * steps_per_epoch
+            if relative_step < 0:
+                return cfg["lr_finetune"]
+            return float(lr_schedule_obj(relative_step))
+
         model.compile(
-            optimizer = _get_optimizer(lr_schedule, cfg),
+            optimizer = _get_optimizer(cfg["lr_finetune"], cfg),
             loss      = MultiOutputHuber(delta=1.0),
             metrics   = ["mae"],
         )
@@ -1011,7 +1044,7 @@ def main() -> None:  # noqa: C901  (complexity OK for orchestration function)
             validation_data = val_ds,
             epochs          = total_epochs,
             initial_epoch   = done,
-            callbacks       = get_standard_callbacks(cfg, state),
+            callbacks       = get_standard_callbacks(cfg, state, lr_scheduler=lr_scheduler_fn),
             verbose         = 1,
         )
 

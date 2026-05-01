@@ -84,6 +84,7 @@ from data_utils import (
     generate_labels_csv,
     pair_microstructure_images,
     validate_dataset,
+    build_pole_figure_cache,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,7 +113,6 @@ CONFIG: Dict = {
 
     # ── label targets (columns from labels.csv) ───────────────────────────────
     "label_cols": [
-        "grain_size",
         "texture_index",
         "avg_misorientation",
     ],
@@ -371,15 +371,40 @@ def build_resnet_model(cfg: Dict,
     inp = keras.Input(shape=(*cfg["img_size"], cfg["img_channels"]),
                       name="micro_input")
 
-    backbone = ResNet50(
+    backbone_base = ResNet50(
         include_top=False,
         weights="imagenet",
-        input_tensor=inp,
         pooling=None,
+    )
+
+    # Create a multi-output model to extract intermediate stages
+    name_map = {
+        "s3": ["conv3_block4_out"],
+        "s4": ["conv4_block6_out"],
+        "s5": ["conv5_block3_out"],
+    }
+    stage_outputs = []
+    for stage in ["s3", "s4", "s5"]:
+        found = False
+        for name in name_map[stage]:
+            try:
+                stage_outputs.append(backbone_base.get_layer(name).output)
+                found = True
+                break
+            except ValueError:
+                continue
+        if not found:
+            raise ValueError(f"Could not find ResNet layers for stage {stage}")
+
+    backbone = keras.Model(
+        inputs=backbone_base.input,
+        outputs=stage_outputs,
+        name="resnet50"
     )
     backbone.trainable = trainable_backbone
 
-    s3, s4, s5 = _get_resnet_stage_outputs(backbone)
+    # Connect backbone to input and get multi-scale features
+    s3, s4, s5 = backbone(inp)
 
     def gap_project(feat, units, name):
         x = layers.GlobalAveragePooling2D(name=f"gap_{name}")(feat)
@@ -426,7 +451,8 @@ class MultiOutputHuber(keras.losses.Loss):
 
     def __init__(self, delta: float = 1.0, **kwargs):
         super().__init__(**kwargs)
-        self._huber = keras.losses.Huber(delta=delta, reduction="auto")
+        self.delta = delta
+        self._huber = keras.losses.Huber(delta=delta, reduction="sum_over_batch_size")
 
     def call(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         y_true = tf.cast(y_true, tf.float32)
@@ -434,7 +460,7 @@ class MultiOutputHuber(keras.losses.Loss):
         return self._huber(y_true, y_pred)
 
     def get_config(self) -> dict:
-        return {**super().get_config(), "delta": self._huber.delta}
+        return {**super().get_config(), "delta": self.delta}
 
 
 def _get_optimizer(lr: float, cfg: Dict) -> keras.optimizers.Optimizer:
@@ -561,25 +587,17 @@ class CheckpointAndLogCallback(keras.callbacks.Callback):
             log.warning("CSV write error: %s", exc)
 
 
-def get_standard_callbacks(cfg: Dict, state: Dict) -> List[keras.callbacks.Callback]:
+def get_standard_callbacks(cfg: Dict, state: Dict, lr_scheduler: Optional[Any] = None) -> List[keras.callbacks.Callback]:
     ckpt_dir  = cfg["ckpt_dir"]
     csv_path  = os.path.join(cfg["log_dir"], "training_log.csv")
     tb_dir    = cfg["tb_dir"]
 
-    return [
+    callbacks = [
         CheckpointAndLogCallback(ckpt_dir, csv_path, state),
         keras.callbacks.EarlyStopping(
             monitor="val_loss",
             patience=12,
             restore_best_weights=True,
-            verbose=1,
-            min_delta=1e-5,
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.5,
-            patience=5,
-            min_lr=1e-8,
             verbose=1,
             min_delta=1e-5,
         ),
@@ -589,6 +607,24 @@ def get_standard_callbacks(cfg: Dict, state: Dict) -> List[keras.callbacks.Callb
             update_freq="epoch",
         ),
     ]
+
+    if lr_scheduler is not None:
+        # If a scheduler is provided (either a function or a callback), use it.
+        if isinstance(lr_scheduler, keras.callbacks.Callback):
+            callbacks.insert(2, lr_scheduler)
+        else:
+            callbacks.insert(2, keras.callbacks.LearningRateScheduler(lr_scheduler))
+    else:
+        # Fallback to ReduceLROnPlateau if no explicit scheduler is used
+        callbacks.insert(2, keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=5,
+            min_lr=1e-8,
+            verbose=1,
+            min_delta=1e-5,
+        ))
+    return callbacks
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -753,6 +789,17 @@ def main() -> None:
     # ── Step 2: Pair with 2D microstructure images ─────────────────────────
     labels_df = pair_microstructure_images(labels_df, cfg["micro_dir"])
 
+    if len(labels_df) < 20:
+        log.warning("Insufficient matched 2D images (%d). Falling back to auto-generated Pole Figures.", len(labels_df))
+        # Reuse labels_df but add generated pole figures as the image column
+        labels_df_full = generate_labels_csv(cfg["h5_dir"], cfg["labels_csv"])
+        labels_df = build_pole_figure_cache(
+            labels_df_full,
+            cache_dir = os.path.join(os.path.dirname(cfg["labels_csv"]), "pole_figures"),
+        )
+        labels_df.rename(columns={"pole_fig_path": "micro_img_path"}, inplace=True)
+        log.info("Using %d generated pole figures as microstructure input.", len(labels_df))
+
     # ── Step 3: Validate ───────────────────────────────────────────────────
     labels_df = validate_dataset(
         labels_df,
@@ -899,15 +946,23 @@ def main() -> None:
 
         state["phase"] = "finetune"
 
-        # Cosine-decay schedule for fine-tuning
+        # Cosine-decay schedule for fine-tuning via Callback (prevents Keras 3 TypeError)
         steps_per_epoch = max(1, len(tr_i) // cfg["batch_size"])
-        lr_schedule = keras.optimizers.schedules.CosineDecay(
+        lr_schedule_obj = keras.optimizers.schedules.CosineDecay(
             initial_learning_rate=cfg["lr_finetune"],
             decay_steps=steps_per_epoch * cfg["finetune_epochs"],
             alpha=1e-7,
         )
+
+        def lr_scheduler_fn(epoch, lr):  # noqa: ARG001
+            # decay is relative to the start of fine-tuning
+            relative_step = (epoch - cfg["warmup_epochs"]) * steps_per_epoch
+            if relative_step < 0:
+                return cfg["lr_finetune"]
+            return float(lr_schedule_obj(relative_step))
+
         model.compile(
-            optimizer=_get_optimizer(lr_schedule, cfg),
+            optimizer=_get_optimizer(cfg["lr_finetune"], cfg),
             loss=MultiOutputHuber(delta=1.0),
             metrics=["mae"],
         )
@@ -917,7 +972,7 @@ def main() -> None:
             validation_data = val_ds,
             epochs          = total_epochs,
             initial_epoch   = done,
-            callbacks       = get_standard_callbacks(cfg, state),
+            callbacks       = get_standard_callbacks(cfg, state, lr_scheduler=lr_scheduler_fn),
             verbose         = 1,
         )
 
