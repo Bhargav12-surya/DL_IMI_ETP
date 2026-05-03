@@ -112,6 +112,15 @@ from tensorflow.keras import layers, regularizers
 # ── local ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_utils import generate_labels_csv, read_h5
+from training_utils import (
+    setup_cuda,
+    setup_train_logger,
+    get_git_info,
+    tag_experiment,
+    save_version_file,
+    get_enhanced_callbacks,
+    build_gradient_accumulation_model,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -170,6 +179,16 @@ CONFIG: Dict = {
     "weight_decay":     1e-4,
     "grad_clip":        1.0,
 
+    # ── gradient accumulation ─────────────────────────────────────────────────
+    "grad_accum_steps": 4,                    # effective batch = 16 × 4 = 64
+
+    # ── checkpoints ───────────────────────────────────────────────────────────
+    "ckpt_every_n_epochs": 10,
+    "max_kept_ckpts":     5,
+
+    # ── version control ───────────────────────────────────────────────────────
+    "git_tag_runs":     False,
+
     # ── splits ────────────────────────────────────────────────────────────────
     "val_frac":         0.15,
     "test_frac":        0.10,
@@ -187,7 +206,7 @@ CONFIG: Dict = {
 # 0.  ENVIRONMENT
 # ═════════════════════════════════════════════════════════════════════════════
 
-def setup_environment(cfg: Dict) -> None:
+def setup_environment(cfg: Dict) -> Dict:
     tf.random.set_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
 
@@ -196,22 +215,9 @@ def setup_environment(cfg: Dict) -> None:
               cfg["graph_cache_dir"]):
         os.makedirs(d, exist_ok=True)
 
-    gpus = tf.config.list_physical_devices("GPU")
-    log.info("GPUs available: %d", len(gpus))
-    for g in gpus:
-        try:
-            tf.config.experimental.set_memory_growth(g, True)
-        except RuntimeError:
-            pass
-
-    if cfg["use_mixed_precision"] and gpus:
-        try:
-            tf.keras.mixed_precision.set_global_policy("mixed_float16")
-            log.info("Mixed precision (fp16) enabled.")
-        except Exception as exc:
-            log.warning("Could not enable mixed precision: %s", exc)
-    else:
-        tf.keras.mixed_precision.set_global_policy("float32")
+    # ── CUDA diagnostics & device setup (replaces manual GPU config) ──────
+    device_diag = setup_cuda(cfg, logger=log)
+    return device_diag
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -262,95 +268,152 @@ def build_grain_graph(h5_path: str, cfg: Dict) -> Optional[Dict[str, np.ndarray]
     phases = data["phases"]  # (N,)   int32  (can be None)
     dims   = data["dims"]    # (3,)   int32  [X, Y, Z]
 
-    if euler is None or grains is None:
+    if euler is None:
         return None
 
-    N = len(euler)
+    if grains is None:
+        # ── pseudo-grain fallback ─────────────────────────────────────────────
+        # If no grains exist in h5, divide volume into a regular grid
+        try:
+            if dims is not None and np.prod(dims[:3]) == len(euler):
+                X, Y, Z = int(dims[0]), int(dims[1]), int(dims[2])
+            else:
+                side = int(round(len(euler) ** (1/3)))
+                X = Y = Z = side
+            
+            grid_res = 8 
+            dx = max(1, X // grid_res)
+            dy = max(1, Y // grid_res)
+            dz = max(1, Z // grid_res)
+            
+            # Recalculate actual grid counts
+            nx_grid = (X + dx - 1) // dx
+            ny_grid = (Y + dy - 1) // dy
+            nz_grid = (Z + dz - 1) // dz
+            
+            E3 = euler.reshape(X, Y, Z, 3)
+            P3 = phases.reshape(X, Y, Z) if phases is not None else None
+            
+            pseudo_nodes = []
+            grid_to_idx = {}
+            
+            for ix in range(nx_grid):
+                for iy in range(ny_grid):
+                    for iz in range(nz_grid):
+                        x0, x1 = ix * dx, min((ix + 1) * dx, X)
+                        y0, y1 = iy * dy, min((iy + 1) * dy, Y)
+                        z0, z1 = iz * dz, min((iz + 1) * dz, Z)
+                        
+                        block_euler = E3[x0:x1, y0:y1, z0:z1].reshape(-1, 3)
+                        mean_euler = block_euler.mean(axis=0)
+                        vol = float(len(block_euler))
+                        
+                        phase = 0.0
+                        if P3 is not None:
+                            block_phase = P3[x0:x1, y0:y1, z0:z1].flatten()
+                            phase = float(np.bincount(block_phase[block_phase >= 0]).argmax()
+                                          if len(block_phase[block_phase >= 0]) else 0)
+                        
+                        node_idx = len(pseudo_nodes)
+                        pseudo_nodes.append({
+                            "euler": mean_euler,
+                            "vol": vol,
+                            "phase": phase
+                        })
+                        grid_to_idx[(ix, iy, iz)] = node_idx
+            
+            n_grains = len(pseudo_nodes)
+            grain_euler = np.array([n["euler"] for n in pseudo_nodes])
+            grain_vol   = np.array([n["vol"] for n in pseudo_nodes])
+            grain_phase = np.array([n["phase"] for n in pseudo_nodes])
+            
+            # Adjacency for regular grid
+            edge_pairs = set()
+            for (ix, iy, iz), i in grid_to_idx.items():
+                for dx_off, dy_off, dz_off in [(1,0,0), (0,1,0), (0,0,1)]:
+                    neighbor = (ix + dx_off, iy + dy_off, iz + dz_off)
+                    if neighbor in grid_to_idx:
+                        j = grid_to_idx[neighbor]
+                        edge_pairs.add((min(i, j), max(i, j)))
+            
+            # Normalise features (same logic as below)
+            grain_vol = np.log1p(grain_vol)
+            grain_vol = (grain_vol - grain_vol.mean()) / (grain_vol.std() + 1e-9)
+            euler_norm = grain_euler / [2*np.pi, np.pi, 2*np.pi]
+            phase_max = grain_phase.max() if grain_phase.max() > 0 else 1.0
+            grain_phase /= phase_max
+            
+            node_feats = np.column_stack([euler_norm, grain_vol, grain_phase]).astype(np.float32)
 
-    # ── subsample very large datasets ────────────────────────────────────────
-    if N > max_voxels:
-        idx    = np.random.choice(N, max_voxels, replace=False)
-        euler  = euler[idx]
-        grains = grains[idx]
-        if phases is not None:
-            phases = phases[idx]
+        except Exception as e:
+            log.debug("Pseudo-grain generation failed: %s", e)
+            return None
+    else:
+        # ── standard grain-based logic ────────────────────────────────────────
+        N = len(euler)
+        if N > max_voxels:
+            idx    = np.random.choice(N, max_voxels, replace=False)
+            euler  = euler[idx]
+            grains = grains[idx]
+            if phases is not None:
+                phases = phases[idx]
 
-    # ── per-grain statistics ──────────────────────────────────────────────────
-    unique_grains = np.unique(grains)
-    unique_grains = unique_grains[unique_grains > 0]           # skip grain 0
+        unique_grains = np.unique(grains)
+        unique_grains = unique_grains[unique_grains > 0]
+        grain_idx_map = {g: i for i, g in enumerate(unique_grains)}
+        n_grains      = len(unique_grains)
 
-    grain_idx_map = {g: i for i, g in enumerate(unique_grains)}
-    n_grains      = len(unique_grains)
+        if n_grains < 2:
+            return None
 
-    if n_grains < 2:
-        return None
+        grain_euler  = np.zeros((n_grains, 3),  dtype=np.float32)
+        grain_vol    = np.zeros((n_grains,),    dtype=np.float32)
+        grain_phase  = np.zeros((n_grains,),    dtype=np.float32)
 
-    grain_euler  = np.zeros((n_grains, 3),  dtype=np.float32)
-    grain_vol    = np.zeros((n_grains,),    dtype=np.float32)
-    grain_phase  = np.zeros((n_grains,),    dtype=np.float32)
+        for g, idx in grain_idx_map.items():
+            mask = grains == g
+            if mask.sum() < min_grain_voxels:
+                continue
+            grain_euler[idx] = euler[mask].mean(axis=0)
+            grain_vol[idx]   = float(mask.sum())
+            if phases is not None:
+                vals = phases[mask]
+                grain_phase[idx] = float(np.bincount(vals[vals >= 0]).argmax()
+                                         if len(vals[vals >= 0]) else 0)
 
-    for g, idx in grain_idx_map.items():
-        mask = grains == g
-        if mask.sum() < min_grain_voxels:
-            continue
-        grain_euler[idx] = euler[mask].mean(axis=0)
-        grain_vol[idx]   = float(mask.sum())
-        if phases is not None:
-            vals = phases[mask]
-            grain_phase[idx] = float(np.bincount(vals[vals >= 0]).argmax()
-                                     if len(vals[vals >= 0]) else 0)
+        grain_vol = np.log1p(grain_vol)
+        grain_vol = (grain_vol - grain_vol.mean()) / (grain_vol.std() + 1e-9)
+        euler_norm = grain_euler / [2*np.pi, np.pi, 2*np.pi]
+        phase_max = grain_phase.max() if grain_phase.max() > 0 else 1.0
+        grain_phase /= phase_max
+        node_feats = np.column_stack([euler_norm, grain_vol, grain_phase]).astype(np.float32)
 
-    # Normalise volume (log-scale then z-score)
-    grain_vol = np.log1p(grain_vol)
-    v_std     = grain_vol.std() + 1e-9
-    grain_vol = (grain_vol - grain_vol.mean()) / v_std
-
-    # Normalise Euler angles to [0, 1]
-    euler_norm      = grain_euler.copy()
-    euler_norm[:, 0] /= (2 * np.pi)
-    euler_norm[:, 1] /= np.pi
-    euler_norm[:, 2] /= (2 * np.pi)
-
-    # Normalise phase (0/1/2 → divide by max observed)
-    phase_max    = grain_phase.max() if grain_phase.max() > 0 else 1.0
-    grain_phase /= phase_max
-
-    node_feats = np.column_stack([euler_norm, grain_vol, grain_phase]).astype(np.float32)
-
-    # ── build adjacency from 3D neighbour pairs ───────────────────────────────
-    # Reshape grains to 3D grid if dims available; otherwise treat as 1D strip
-    try:
-        if dims is not None and np.prod(dims[:3]) == len(grains):
-            X, Y, Z = int(dims[0]), int(dims[1]), int(dims[2])
-        else:
-            # Guess cubic shape
-            side = int(round(len(grains) ** (1/3)))
-            X = Y = Z = side
-        G3 = grains.reshape(X, Y, Z)
-
-        edge_pairs: set = set()
-
-        def _add_pairs(a: np.ndarray, b: np.ndarray) -> None:
-            """Add (i, j) pairs where a[v] != b[v] and both are valid grains."""
-            mask = (a > 0) & (b > 0) & (a != b)
-            for gi, gj in zip(a[mask], b[mask]):
-                if gi in grain_idx_map and gj in grain_idx_map:
-                    i, j = grain_idx_map[gi], grain_idx_map[gj]
-                    edge_pairs.add((min(i, j), max(i, j)))
-
-        _add_pairs(G3[:-1, :, :].ravel(), G3[1:, :, :].ravel())
-        _add_pairs(G3[:, :-1, :].ravel(), G3[:, 1:, :].ravel())
-        _add_pairs(G3[:, :, :-1].ravel(), G3[:, :, 1:].ravel())
-
-    except Exception:
-        # Fallback: 1-D neighbour adjacency
-        edge_pairs = set()
-        for v in range(len(grains) - 1):
-            gi, gj = int(grains[v]), int(grains[v + 1])
-            if gi > 0 and gj > 0 and gi != gj:
-                if gi in grain_idx_map and gj in grain_idx_map:
-                    i, j = grain_idx_map[gi], grain_idx_map[gj]
-                    edge_pairs.add((min(i, j), max(i, j)))
+        # Build adjacency
+        try:
+            if dims is not None and np.prod(dims[:3]) == len(grains):
+                X, Y, Z = int(dims[0]), int(dims[1]), int(dims[2])
+            else:
+                side = int(round(len(grains) ** (1/3)))
+                X = Y = Z = side
+            G3 = grains.reshape(X, Y, Z)
+            edge_pairs: set = set()
+            def _add_pairs(a, b):
+                mask = (a > 0) & (b > 0) & (a != b)
+                for gi, gj in zip(a[mask], b[mask]):
+                    if gi in grain_idx_map and gj in grain_idx_map:
+                        i, j = grain_idx_map[gi], grain_idx_map[gj]
+                        edge_pairs.add((min(i, j), max(i, j)))
+            _add_pairs(G3[:-1, :, :].ravel(), G3[1:, :, :].ravel())
+            _add_pairs(G3[:, :-1, :].ravel(), G3[:, 1:, :].ravel())
+            _add_pairs(G3[:, :, :-1].ravel(), G3[:, :, 1:].ravel())
+        except Exception:
+            edge_pairs = set()
+            for v in range(len(grains) - 1):
+                gi, gj = int(grains[v]), int(grains[v + 1])
+                if gi > 0 and gj > 0 and gi != gj:
+                    if gi in grain_idx_map and gj in grain_idx_map:
+                        i, j = grain_idx_map[gi], grain_idx_map[gj]
+                        edge_pairs.add((min(i, j), max(i, j)))
 
     if len(edge_pairs) == 0:
         return None
@@ -621,7 +684,10 @@ class CGCNNConv(layers.Layer):
 class SqueezeExcitation(layers.Layer):
     """Channel-wise SE block."""
 
-    def __init__(self, channels: int, ratio: int = 8, **kwargs):
+    def __init__(self, channels: int = None, ratio: int = 8, **kwargs):
+        # backward compat: older saved models stored 'units' instead of 'channels'
+        if channels is None:
+            channels = kwargs.pop("units", 64)
         super().__init__(**kwargs)
         self.channels = channels
         self.ratio = ratio
@@ -629,8 +695,7 @@ class SqueezeExcitation(layers.Layer):
         self.fc2 = layers.Dense(channels, activation="sigmoid")
 
     def call(self, x: tf.Tensor) -> tf.Tensor:
-        se = tf.reduce_mean(x, axis=-1, keepdims=True)
-        se = self.fc1(se)
+        se = self.fc1(x)
         se = self.fc2(se)
         return x * se
 
@@ -691,10 +756,12 @@ def build_cgcnn_model(cfg: Dict) -> keras.Model:
         )
 
     # ── global mean pooling (masked) ──────────────────────────────────────────
-    mask_expand = tf.expand_dims(inp_node_mask, axis=-1)           # (B, N, 1)
-    sum_feats   = tf.reduce_sum(h * mask_expand, axis=1)           # (B, D)
-    n_real      = tf.reduce_sum(inp_node_mask, axis=1, keepdims=True) + 1e-9
-    graph_emb   = sum_feats / n_real                               # (B, D)
+    # BUG-FIX: In Keras 3 (TF 2.16+), raw tf.* ops cannot be called on
+    # KerasTensors during functional model construction.  Use keras.ops instead.
+    mask_expand = keras.ops.expand_dims(inp_node_mask, axis=-1)     # (B, N, 1)
+    sum_feats   = keras.ops.sum(h * mask_expand, axis=1)            # (B, D)
+    n_real      = keras.ops.sum(inp_node_mask, axis=1, keepdims=True) + 1e-9
+    graph_emb   = sum_feats / n_real                                 # (B, D)
 
     # ── head ──────────────────────────────────────────────────────────────────
     x = layers.Dense(512, activation="gelu",
@@ -737,7 +804,7 @@ def build_embedding_extractor(model: keras.Model, cfg: Dict) -> keras.Model:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 4.  TRAINING UTILITIES
+# 4.  TRAINING UTILITIES  (checkpoint state + callbacks via shared module)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _get_optimizer(lr, cfg: Dict) -> keras.optimizers.Optimizer:
@@ -766,68 +833,7 @@ def _load_state(ckpt_dir: str) -> Dict:
 
 def _save_state(state: Dict, ckpt_dir: str) -> None:
     with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
-        json.dump(state, f, indent=2)
-
-
-class _StateCallback(keras.callbacks.Callback):
-    """Persist training state after every epoch for safe resume."""
-
-    def __init__(self, cfg: Dict, state: Dict):
-        super().__init__()
-        self.cfg   = cfg
-        self.state = state
-
-    def on_epoch_end(self, epoch: int, logs=None) -> None:
-        self.state["completed_epochs"] = epoch + 1
-        val_loss = (logs or {}).get("val_loss", float("inf"))
-        if val_loss < self.state["best_val_loss"]:
-            self.state["best_val_loss"] = val_loss
-        _save_state(self.state, self.cfg["ckpt_dir"])
-
-        # Save last checkpoint every epoch (OOM-safe resume)
-        self.model.save(os.path.join(self.cfg["ckpt_dir"], "last_model.keras"))
-
-        # CSV logging
-        row = {"epoch": epoch + 1, "timestamp": datetime.utcnow().isoformat(),
-               **(logs or {})}
-        csv_path = os.path.join(self.cfg["log_dir"], "training_log.csv")
-        write_header = not os.path.exists(csv_path)
-        with open(csv_path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=row.keys())
-            if write_header:
-                w.writeheader()
-            w.writerow(row)
-
-
-def get_standard_callbacks(cfg: Dict, state: Dict, lr_scheduler: Optional[Any] = None) -> List[keras.callbacks.Callback]:
-    best_path = os.path.join(cfg["ckpt_dir"], "best_model.keras")
-    callbacks = [
-        keras.callbacks.ModelCheckpoint(
-            best_path, monitor="val_loss",
-            save_best_only=True, verbose=1,
-        ),
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=20,
-            restore_best_weights=True, verbose=1,
-        ),
-        keras.callbacks.TensorBoard(
-            log_dir=cfg["tb_dir"],
-            histogram_freq=0, update_freq="epoch",
-        ),
-        _StateCallback(cfg, state),
-    ]
-
-    if lr_scheduler is not None:
-        if isinstance(lr_scheduler, keras.callbacks.Callback):
-            callbacks.insert(2, lr_scheduler)
-        else:
-            callbacks.insert(2, keras.callbacks.LearningRateScheduler(lr_scheduler))
-    else:
-        callbacks.insert(2, keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5,
-            patience=8, min_lr=1e-7, verbose=1,
-        ))
-    return callbacks
+        json.dump(state, f, indent=2, default=str)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -943,9 +949,22 @@ def extract_and_save_embeddings(model: keras.Model,
 
 def main() -> None:
     cfg = CONFIG
-    setup_environment(cfg)
+    device_diag = setup_environment(cfg)
+
+    # ── Structured file logger & run ID ───────────────────────────────────
+    run_id, _ = setup_train_logger("cgcnn", cfg["log_dir"], logger=log)
+
+    # ── Git version info ──────────────────────────────────────────────────
+    git_info = get_git_info()
+    log.info("Git commit : %s  (dirty=%s)", git_info["commit_hash"][:8],
+             git_info["is_dirty"])
+
     log.info("=" * 60)
     log.info("  CGCNN Atomic-Structure Branch — training start")
+    log.info("  Run ID   : %s", run_id)
+    log.info("  Grad Accum Steps: %d  (effective batch = %d)",
+             cfg["grad_accum_steps"],
+             cfg["batch_size"] * cfg["grad_accum_steps"])
     log.info("=" * 60)
 
     # ── Step 1: Labels ─────────────────────────────────────────────────────
@@ -1040,7 +1059,8 @@ def main() -> None:
             validation_data=val_ds,
             epochs=cfg["warmup_epochs"],
             initial_epoch=done,
-            callbacks=get_standard_callbacks(cfg, state),
+            callbacks=get_enhanced_callbacks(
+                cfg, state, run_id, logger=log),
             verbose=1,
         )
         done = state["completed_epochs"]
@@ -1087,7 +1107,9 @@ def main() -> None:
             validation_data=val_ds,
             epochs=total,
             initial_epoch=done,
-            callbacks=get_standard_callbacks(cfg, state, lr_scheduler=lr_scheduler_fn),
+            callbacks=get_enhanced_callbacks(
+                cfg, state, run_id, lr_scheduler=lr_scheduler_fn,
+                logger=log),
             verbose=1,
         )
 
@@ -1111,8 +1133,13 @@ def main() -> None:
     log.info("Extracting embeddings for Fusion Layer …")
     extract_and_save_embeddings(model, all_ds, cfg)
 
+    # ── Git experiment tag (opt-in) ────────────────────────────────────────
+    if cfg.get("git_tag_runs", False):
+        tag_experiment("cgcnn", run_id, logger=log)
+
     log.info("=" * 60)
     log.info("  CGCNN training complete.")
+    log.info("  Run ID      → %s", run_id)
     log.info("  Best model  → %s", best_ckpt)
     log.info("  Embeddings  → %s/embeddings.npy", cfg["output_dir"])
     log.info("=" * 60)

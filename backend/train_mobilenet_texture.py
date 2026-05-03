@@ -118,6 +118,15 @@ from data_utils import (
     generate_labels_csv,
     validate_dataset,
 )
+from training_utils import (
+    setup_cuda,
+    setup_train_logger,
+    get_git_info,
+    tag_experiment,
+    save_version_file,
+    get_enhanced_callbacks,
+    build_gradient_accumulation_model,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -177,6 +186,16 @@ CONFIG: Dict = {
     "grad_clip":        1.0,
     "unfreeze_from":    0.50,               # fraction of backbone to unfreeze
 
+    # ── gradient accumulation ─────────────────────────────────────────────────
+    "grad_accum_steps": 4,                    # effective batch = 32 × 4 = 128
+
+    # ── checkpoints ───────────────────────────────────────────────────────────
+    "ckpt_every_n_epochs": 10,                # save epoch-N snapshot every 10
+    "max_kept_ckpts":     5,                  # prune oldest snapshots past 5
+
+    # ── version control ───────────────────────────────────────────────────────
+    "git_tag_runs":     False,                # create git tag after training
+
     # ── augmentation ──────────────────────────────────────────────────────────
     "use_mixup":        True,
     "mixup_alpha":      0.2,
@@ -202,7 +221,7 @@ CONFIG: Dict = {
 # 0.  ENVIRONMENT SETUP
 # ═════════════════════════════════════════════════════════════════════════════
 
-def setup_environment(cfg: Dict) -> None:
+def setup_environment(cfg: Dict) -> Dict:
     """Configure GPU memory growth, global seeds, directories, mixed precision."""
     tf.random.set_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
@@ -212,22 +231,9 @@ def setup_environment(cfg: Dict) -> None:
               cfg["pole_fig_dir"]):
         os.makedirs(d, exist_ok=True)
 
-    gpus = tf.config.list_physical_devices("GPU")
-    log.info("GPUs available: %d", len(gpus))
-    for g in gpus:
-        try:
-            tf.config.experimental.set_memory_growth(g, True)
-        except RuntimeError:
-            pass
-
-    if cfg["use_mixed_precision"] and gpus:
-        try:
-            tf.keras.mixed_precision.set_global_policy("mixed_float16")
-            log.info("Mixed precision (fp16) enabled.")
-        except Exception as exc:
-            log.warning("Could not enable mixed precision: %s", exc)
-    else:
-        tf.keras.mixed_precision.set_global_policy("float32")
+    # ── CUDA diagnostics & device setup (replaces manual GPU config) ──────
+    device_diag = setup_cuda(cfg, logger=log)
+    return device_diag
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -566,7 +572,7 @@ def compile_model(model: keras.Model, lr, cfg: Dict) -> keras.Model:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 4.  CHECKPOINT STATE  (JSON-based resume logic)
+# 5.  CALLBACKS  (via shared training_utils)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _load_state(ckpt_dir: str) -> Dict:
@@ -587,113 +593,7 @@ def _load_state(ckpt_dir: str) -> Dict:
 def _save_state(state: Dict, ckpt_dir: str) -> None:
     """Persist training state to JSON."""
     with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
-        json.dump(state, f, indent=2)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 5.  CALLBACKS
-# ═════════════════════════════════════════════════════════════════════════════
-
-class CheckpointAndLogCallback(keras.callbacks.Callback):
-    """
-    Per-epoch callback that:
-      1. Saves  last_model.keras  (unconditional – ensures OOM-safe resume)
-      2. Saves  best_model.keras  (only if val_loss improved)
-      3. Appends a row to the CSV training log
-      4. Writes training_state.json for next-run resume logic
-    """
-
-    def __init__(self, ckpt_dir: str, csv_path: str, state: Dict):
-        super().__init__()
-        self.ckpt_dir          = ckpt_dir
-        self.csv_path          = csv_path
-        self.state             = state
-        self.best_val_loss     = float(state.get("best_val_loss", float("inf")))
-        self._csv_header_written = os.path.exists(csv_path)
-
-    def on_epoch_end(self, epoch: int, logs: Optional[Dict] = None) -> None:
-        logs = logs or {}
-        ts   = datetime.now().isoformat(timespec="seconds")
-
-        # ── 1. Always save last checkpoint ──
-        last_path = os.path.join(self.ckpt_dir, "last_model.keras")
-        try:
-            self.model.save(last_path, overwrite=True)
-        except Exception as exc:
-            log.warning("Could not save last checkpoint: %s", exc)
-
-        # ── 2. Save best checkpoint ──
-        val_loss = float(logs.get("val_loss", float("inf")))
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-            best_path = os.path.join(self.ckpt_dir, "best_model.keras")
-            try:
-                self.model.save(best_path, overwrite=True)
-                log.info("  ✓ Best model updated  (val_loss = %.5f)", val_loss)
-            except Exception as exc:
-                log.warning("Could not save best checkpoint: %s", exc)
-
-        # ── 3. Persist training state ──
-        self.state["completed_epochs"] = epoch + 1
-        self.state["best_val_loss"]    = self.best_val_loss
-        _save_state(self.state, self.ckpt_dir)
-
-        # ── 4. CSV append ──
-        row = {
-            "epoch":     epoch + 1,
-            "timestamp": ts,
-            **{k: (f"{v:.6f}" if isinstance(v, float) else v)
-               for k, v in logs.items()},
-        }
-        try:
-            mode = "a" if self._csv_header_written else "w"
-            with open(self.csv_path, mode, newline="") as fh:
-                writer = csv.DictWriter(fh, fieldnames=list(row.keys()))
-                if not self._csv_header_written:
-                    writer.writeheader()
-                    self._csv_header_written = True
-                writer.writerow(row)
-        except Exception as exc:
-            log.warning("CSV write error: %s", exc)
-
-
-def get_standard_callbacks(cfg: Dict, state: Dict, lr_scheduler: Optional[Any] = None) -> List[keras.callbacks.Callback]:
-    """Return the standard set of callbacks used in both training phases."""
-    ckpt_dir = cfg["ckpt_dir"]
-    csv_path = os.path.join(cfg["log_dir"], "training_log.csv")
-    tb_dir   = cfg["tb_dir"]
-
-    callbacks = [
-        CheckpointAndLogCallback(ckpt_dir, csv_path, state),
-        keras.callbacks.EarlyStopping(
-            monitor              = "val_loss",
-            patience             = 12,
-            restore_best_weights = True,
-            verbose              = 1,
-            min_delta            = 1e-5,
-        ),
-        keras.callbacks.TensorBoard(
-            log_dir        = tb_dir,
-            histogram_freq = 0,
-            update_freq    = "epoch",
-        ),
-    ]
-
-    if lr_scheduler is not None:
-        if isinstance(lr_scheduler, keras.callbacks.Callback):
-            callbacks.insert(2, lr_scheduler)
-        else:
-            callbacks.insert(2, keras.callbacks.LearningRateScheduler(lr_scheduler))
-    else:
-        callbacks.insert(2, keras.callbacks.ReduceLROnPlateau(
-            monitor   = "val_loss",
-            factor    = 0.5,
-            patience  = 5,
-            min_lr    = 1e-8,
-            verbose   = 1,
-            min_delta = 1e-5,
-        ))
-    return callbacks
+        json.dump(state, f, indent=2, default=str)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -847,10 +747,22 @@ def extract_and_save_embeddings(model: keras.Model,
 
 def main() -> None:  # noqa: C901  (complexity OK for orchestration function)
     cfg = CONFIG
-    setup_environment(cfg)
+    device_diag = setup_environment(cfg)
+
+    # ── Structured file logger & run ID ───────────────────────────────────
+    run_id, _ = setup_train_logger("mobilenet", cfg["log_dir"], logger=log)
+
+    # ── Git version info ──────────────────────────────────────────────────
+    git_info = get_git_info()
+    log.info("Git commit : %s  (dirty=%s)", git_info["commit_hash"][:8],
+             git_info["is_dirty"])
 
     log.info("=" * 64)
     log.info("  MobileNetV2 – Texture Branch  Training")
+    log.info("  Run ID   : %s", run_id)
+    log.info("  Grad Accum Steps: %d  (effective batch = %d)",
+             cfg["grad_accum_steps"],
+             cfg["batch_size"] * cfg["grad_accum_steps"])
     log.info("=" * 64)
 
     # ── Step 1: Generate / load labels CSV ───────────────────────────────────
@@ -965,7 +877,8 @@ def main() -> None:  # noqa: C901  (complexity OK for orchestration function)
             validation_data = val_ds,
             epochs          = cfg["warmup_epochs"],
             initial_epoch   = done,
-            callbacks       = get_standard_callbacks(cfg, state),
+            callbacks       = get_enhanced_callbacks(
+                cfg, state, run_id, logger=log),
             verbose         = 1,
         )
         done = state["completed_epochs"]
@@ -1044,7 +957,9 @@ def main() -> None:  # noqa: C901  (complexity OK for orchestration function)
             validation_data = val_ds,
             epochs          = total_epochs,
             initial_epoch   = done,
-            callbacks       = get_standard_callbacks(cfg, state, lr_scheduler=lr_scheduler_fn),
+            callbacks       = get_enhanced_callbacks(
+                cfg, state, run_id, lr_scheduler=lr_scheduler_fn,
+                logger=log),
             verbose         = 1,
         )
 
@@ -1064,8 +979,13 @@ def main() -> None:  # noqa: C901  (complexity OK for orchestration function)
 
     extract_and_save_embeddings(model, all_ds, cfg)
 
+    # ── Git experiment tag (opt-in) ────────────────────────────────────────
+    if cfg.get("git_tag_runs", False):
+        tag_experiment("mobilenet", run_id, logger=log)
+
     log.info("=" * 64)
     log.info("  ✓ Training complete.")
+    log.info("  Run ID          → %s", run_id)
     log.info("  Best model      → %s", best_ckpt)
     log.info("  Metrics         → %s/metrics.json", cfg["output_dir"])
     log.info("  Embeddings      → %s/embeddings.npy", cfg["output_dir"])

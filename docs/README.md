@@ -230,6 +230,79 @@ Each branch follows the same training protocol:
 - **Mixed precision**: FP16 compute with FP32 accumulation (2× GPU throughput)
 - **Checkpoint resume**: `training_state.json` tracks epoch, phase, and best val_loss
 
+### Gradient Accumulation
+
+All training scripts support gradient accumulation for training with larger effective batch sizes on limited VRAM:
+
+```python
+# In each script's CONFIG dict:
+"grad_accum_steps": 4,    # effective batch = batch_size × 4
+```
+
+| Script | batch_size | grad_accum_steps | Effective Batch |
+|--------|-----------|-----------------|-----------------|
+| ResNet | 32 | 4 | 128 |
+| MobileNet | 32 | 4 | 128 |
+| CGCNN | 16 | 4 | 64 |
+| Fusion | 32 | 4 | 128 |
+
+Set `"grad_accum_steps": 1` to disable. No code changes needed — the wrapper is transparent to `model.fit()`.
+
+### CUDA Device Selection
+
+The pipeline automatically detects and configures GPUs. You can control device selection via:
+
+```python
+# In CONFIG — select specific GPU(s)
+"cuda_visible_devices": "0",      # use GPU 0 only
+"cuda_visible_devices": "0,1",    # multi-GPU
+"cuda_visible_devices": "",       # force CPU
+
+# Or via environment variable
+CUDA_VISIBLE_DEVICES=0 python backend/train_resnet_microstructure.py
+```
+
+At startup, each script prints a diagnostic banner showing:
+- TensorFlow version, CUDA version, cuDNN version
+- GPU name(s), compute capability
+- Mixed precision status
+
+### Enhanced Checkpoints
+
+Beyond the standard `best_model.keras` and `last_model.keras`, the pipeline now saves:
+
+- **Epoch-N snapshots**: `ckpt_epoch_0010.keras`, `ckpt_epoch_0020.keras`, etc.
+- **VERSION.json**: Full reproducibility metadata (git hash, config, device info)
+- **Automatic pruning**: Old snapshots are deleted when `max_kept_ckpts` is exceeded
+
+```python
+"ckpt_every_n_epochs": 10,    # snapshot frequency
+"max_kept_ckpts": 5,          # keep at most 5 epoch snapshots
+```
+
+### Training Logs
+
+Each training run creates a structured log file in `logs/<branch>/train_<run_id>.log` containing:
+- All Python `log.info()` output
+- System info (OS, Python, TF version, GPU)
+- Run ID and timestamp
+
+The CSV training log (`training_log.csv`) now includes a `run_id` column for tracking across restarts.
+
+### Git Version Control
+
+Each training run automatically captures:
+- **Git commit hash** and branch name
+- **Dirty flag** (whether there are uncommitted changes)
+- **Commit message**
+
+This info is saved in both `training_state.json` and `VERSION.json`.
+
+Optional: auto-tag experiments in git:
+```python
+"git_tag_runs": True,    # creates tag: run/resnet/20260502T153000_a1b2c3
+```
+
 ### Fusion Layer Modes
 
 | Mode | Speed | Description |

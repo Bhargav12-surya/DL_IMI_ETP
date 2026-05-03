@@ -105,6 +105,15 @@ except ImportError:
     _CGCNN_AVAILABLE = False
     logging.warning("train_cgcnn_atomic not importable — CGCNN custom objects "
                     "unavailable; load from saved weights only.")
+from training_utils import (
+    setup_cuda,
+    setup_train_logger,
+    get_git_info,
+    tag_experiment,
+    save_version_file,
+    get_enhanced_callbacks,
+    build_gradient_accumulation_model,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -193,6 +202,16 @@ FUSION_CONFIG: Dict = {
     "num_parallel":        tf.data.AUTOTUNE,
     "voxel_size_um":       1.0,
 
+    # ── gradient accumulation ───────────────────────────────────────────────
+    "grad_accum_steps":    4,
+
+    # ── checkpoints ─────────────────────────────────────────────────────────
+    "ckpt_every_n_epochs": 10,
+    "max_kept_ckpts":      5,
+
+    # ── version control ───────────────────────────────────────────────────
+    "git_tag_runs":        False,
+
     # CGCNN graph settings (needed for online mode / direct graph loading)
     "max_nodes":           512,
     "max_edges":           4096,
@@ -205,29 +224,16 @@ FUSION_CONFIG: Dict = {
 # 0.  ENVIRONMENT
 # ═════════════════════════════════════════════════════════════════════════════
 
-def setup_environment(cfg: Dict) -> None:
+def setup_environment(cfg: Dict) -> Dict:
     tf.random.set_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
     for d in (cfg["ckpt_dir"], cfg["log_dir"],
               cfg["output_dir"], cfg["tb_dir"]):
         os.makedirs(d, exist_ok=True)
 
-    gpus = tf.config.list_physical_devices("GPU")
-    log.info("GPUs available: %d", len(gpus))
-    for g in gpus:
-        try:
-            tf.config.experimental.set_memory_growth(g, True)
-        except RuntimeError:
-            pass
-
-    if cfg["use_mixed_precision"] and gpus:
-        try:
-            tf.keras.mixed_precision.set_global_policy("mixed_float16")
-            log.info("Mixed precision (fp16) enabled.")
-        except Exception as exc:
-            log.warning("Could not enable mixed precision: %s", exc)
-    else:
-        tf.keras.mixed_precision.set_global_policy("float32")
+    # ── CUDA diagnostics & device setup (replaces manual GPU config) ──────
+    device_diag = setup_cuda(cfg, logger=log)
+    return device_diag
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -392,7 +398,7 @@ class MultiOutputHuber(keras.losses.Loss):
     def __init__(self, delta: float = 1.0, **kwargs):
         super().__init__(**kwargs)
         self.delta = delta
-        self._huber = keras.losses.Huber(delta=delta, reduction="auto")
+        self._huber = keras.losses.Huber(delta=delta, reduction="sum_over_batch_size")
 
     def call(self, y_true, y_pred):
         y_true = tf.cast(y_true, tf.float32)
@@ -508,63 +514,7 @@ def _load_state(ckpt_dir: str) -> Dict:
 
 def _save_state(state: Dict, ckpt_dir: str) -> None:
     with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
-        json.dump(state, f, indent=2)
-
-
-class _StateCallback(keras.callbacks.Callback):
-    def __init__(self, cfg: Dict, state: Dict):
-        super().__init__()
-        self.cfg   = cfg
-        self.state = state
-
-    def on_epoch_end(self, epoch: int, logs=None) -> None:
-        self.state["completed_epochs"] = epoch + 1
-        val_loss = (logs or {}).get("val_loss", float("inf"))
-        if val_loss < self.state["best_val_loss"]:
-            self.state["best_val_loss"] = val_loss
-        _save_state(self.state, self.cfg["ckpt_dir"])
-        self.model.save(os.path.join(self.cfg["ckpt_dir"], "last_model.keras"))
-
-        row = {"epoch": epoch + 1, "timestamp": datetime.utcnow().isoformat(),
-               **(logs or {})}
-        csv_path = os.path.join(self.cfg["log_dir"], "training_log.csv")
-        write_header = not os.path.exists(csv_path)
-        with open(csv_path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=row.keys())
-            if write_header:
-                w.writeheader()
-            w.writerow(row)
-
-
-def get_standard_callbacks(cfg: Dict, state: Dict, lr_scheduler: Optional[Any] = None) -> List[keras.callbacks.Callback]:
-    best_path = os.path.join(cfg["ckpt_dir"], "best_model.keras")
-    callbacks = [
-        keras.callbacks.ModelCheckpoint(
-            best_path, monitor="val_loss",
-            save_best_only=True, verbose=1,
-        ),
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=20,
-            restore_best_weights=True, verbose=1,
-        ),
-        keras.callbacks.TensorBoard(
-            log_dir=cfg["tb_dir"],
-            histogram_freq=0, update_freq="epoch",
-        ),
-        _StateCallback(cfg, state),
-    ]
-
-    if lr_scheduler is not None:
-        if isinstance(lr_scheduler, keras.callbacks.Callback):
-            callbacks.insert(2, lr_scheduler)
-        else:
-            callbacks.insert(2, keras.callbacks.LearningRateScheduler(lr_scheduler))
-    else:
-        callbacks.insert(2, keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5,
-            patience=8, min_lr=1e-7, verbose=1,
-        ))
-    return callbacks
+        json.dump(state, f, indent=2, default=str)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -666,9 +616,20 @@ def _get_custom_objects() -> Dict:
 
 def main() -> None:
     cfg = FUSION_CONFIG
-    setup_environment(cfg)
+    device_diag = setup_environment(cfg)
+
+    # ── Structured file logger & run ID ───────────────────────────────────
+    run_id, _ = setup_train_logger("fusion", cfg["log_dir"], logger=log)
+
+    # ── Git version info ──────────────────────────────────────────────────
+    git_info = get_git_info()
+    log.info("Git commit : %s  (dirty=%s)", git_info["commit_hash"][:8],
+             git_info["is_dirty"])
+
     log.info("=" * 60)
     log.info("  Fusion Layer — mode: %s", cfg["mode"].upper())
+    log.info("  Run ID   : %s", run_id)
+    log.info("  Grad Accum Steps: %d", cfg["grad_accum_steps"])
     log.info("=" * 60)
 
     # ── Step 1: Labels ─────────────────────────────────────────────────────
@@ -747,7 +708,8 @@ def main() -> None:
                 train_ds, validation_data=val_ds,
                 epochs=cfg["warmup_epochs"],
                 initial_epoch=done,
-                callbacks=get_standard_callbacks(cfg, state),
+                callbacks=get_enhanced_callbacks(
+                    cfg, state, run_id, logger=log),
                 verbose=1,
             )
             done = state["completed_epochs"]
@@ -788,7 +750,9 @@ def main() -> None:
                 train_ds, validation_data=val_ds,
                 epochs=total,
                 initial_epoch=done,
-                callbacks=get_standard_callbacks(cfg, state, lr_scheduler=lr_scheduler_fn),
+                callbacks=get_enhanced_callbacks(
+                    cfg, state, run_id, lr_scheduler=lr_scheduler_fn,
+                    logger=log),
                 verbose=1,
             )
 
@@ -876,7 +840,8 @@ def main() -> None:
                 train_ds, validation_data=val_ds,
                 epochs=cfg["warmup_epochs"],
                 initial_epoch=done,
-                callbacks=get_standard_callbacks(cfg, state),
+                callbacks=get_enhanced_callbacks(
+                    cfg, state, run_id, logger=log),
                 verbose=1,
             )
             done = state["completed_epochs"]
@@ -922,7 +887,8 @@ def main() -> None:
                 train_ds, validation_data=val_ds,
                 epochs=total,
                 initial_epoch=done,
-                callbacks=get_standard_callbacks(cfg, state),
+                callbacks=get_enhanced_callbacks(
+                    cfg, state, run_id, logger=log),
                 verbose=1,
             )
 
@@ -947,8 +913,13 @@ def main() -> None:
     model.save(final_path)
     log.info("Fusion model → %s", final_path)
 
+    # ── Git experiment tag (opt-in) ────────────────────────────────────────
+    if cfg.get("git_tag_runs", False):
+        tag_experiment("fusion", run_id, logger=log)
+
     log.info("=" * 60)
     log.info("  Fusion Layer training complete.")
+    log.info("  Run ID   → %s", run_id)
     log.info("  Model    → %s", final_path)
     log.info("  Metrics  → %s/metrics.json", cfg["output_dir"])
     log.info("=" * 60)

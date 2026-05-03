@@ -76,7 +76,9 @@ _KAM_CANDIDATES = [
 _PHASE_CANDIDATES = [
     "/DataContainers/ImageDataContainer/CellData/Phases",
     "/DataContainers/SyntheticVolumeDataContainer/CellData/Phases",
+    "Scan 1/EBSD/Data/Phase",
     "Phases",
+    "Phase",
 ]
 _DIM_CANDIDATES = [
     "/DataContainers/ImageDataContainer/_SIMPL_GEOMETRY/DIMENSIONS",
@@ -127,10 +129,28 @@ def read_h5(path: str) -> Dict[str, Optional[np.ndarray]]:
             phases = _h5_read_first(f, _PHASE_CANDIDATES)
             dims   = _h5_read_first(f, _DIM_CANDIDATES)
 
-        # Normalise shapes
+            # ── BUG-FIX: dim recovery must stay inside the `with` block ──────
+            # Normalise euler shape first so len(euler) is available
+            _euler_tmp = euler.reshape(-1, 3) if euler is not None else None
+            _n_voxels  = len(_euler_tmp) if _euler_tmp is not None else 0
+
+            if (dims is None or np.prod(dims) != _n_voxels) and _n_voxels > 0:
+                try:
+                    # Oxford / EDAX CTF-style header inside h5
+                    if ("Scan 1/EBSD/Header/nColumns" in f and
+                            "Scan 1/EBSD/Header/nRows" in f):
+                        nx = int(np.array(f["Scan 1/EBSD/Header/nColumns"]).ravel()[0])
+                        ny = int(np.array(f["Scan 1/EBSD/Header/nRows"]).ravel()[0])
+                        if nx * ny == _n_voxels:
+                            dims = np.array([nx, ny, 1], dtype=np.int32)
+                    elif "Scan 1/EBSD/Header/Step X" in f:
+                        pass   # step-size only; can't infer shape
+                except Exception as _e:
+                    log.debug("Dimension recovery failed: %s", _e)
+
+        # ── Normalise shapes (file is now safely closed) ───────────────────
         if euler is not None:
             euler = euler.reshape(-1, 3).astype(np.float32)
-            # Convert degrees → radians if values are clearly in degrees
             if euler.max() > 2 * np.pi + 0.1:
                 euler = np.deg2rad(euler)
 
@@ -452,6 +472,11 @@ def generate_labels_csv(h5_dir: str,
             grains = data["grains"]
             n_ori  = len(ea)
             n_grn  = int(np.unique(grains[grains > 0]).size) if grains is not None else 0
+            
+            # If grains are missing, CGCNN will use pseudo-grains (estimated count)
+            if n_grn == 0 and data["euler"] is not None:
+                # Approximate number of pseudo-grains based on default grid size 8
+                n_grn = 8 * 8 * 8  # 512
 
             grain_size   = float("nan")
             avg_misor    = float("nan")
@@ -460,9 +485,39 @@ def generate_labels_csv(h5_dir: str,
                 grain_size = estimate_mean_grain_size(grains, voxel_size_um)
                 if compute_misorientation:
                     avg_misor = compute_average_misorientation(ea, grains)
-            elif data.get("kam") is not None:
-                # Fallback to mean KAM if grain-level misorientation cannot be computed
-                avg_misor = float(np.mean(data["kam"]))
+            else:
+                # ── BUG-FIX: estimate labels when FeatureIds are absent ────────
+                # Raw EBSD files from the Dryad dataset do not contain pre-segmented
+                # grain IDs.  We estimate grain_size from a pseudo-grid partition
+                # (same 8×8×8 grid the CGCNN branch will use) and avg_misorientation
+                # from random Euler-angle pairs across the whole volume.
+                N = len(ea)
+                grid_res = 8
+                # Each pseudo-grain covers ~N/(grid_res³) voxels
+                n_pseudo = float(grid_res ** 3)
+                voxels_per_grain = max(1.0, N / n_pseudo)
+                vol_um3  = voxels_per_grain * (voxel_size_um ** 3)
+                radius   = (3.0 * vol_um3 / (4.0 * np.pi)) ** (1.0 / 3.0)
+                grain_size = float(radius * 2.0)
+
+                if data.get("kam") is not None:
+                    avg_misor = float(np.mean(data["kam"]))
+                elif compute_misorientation and N >= 2:
+                    # Random-pair misorientation estimate (fast sample of 500 pairs)
+                    n_pairs = min(500, N)
+                    rng = np.random.default_rng(seed=42)
+                    idx_a = rng.integers(0, N, n_pairs)
+                    idx_b = rng.integers(0, N, n_pairs)
+                    misor_list: List[float] = []
+                    for ia, ib in zip(idx_a, idx_b):
+                        if ia == ib:
+                            continue
+                        g1 = _euler_to_R(*ea[ia])
+                        g2 = _euler_to_R(*ea[ib])
+                        tr = float(np.trace(g1 @ g2.T))
+                        cos_a = float(np.clip((tr - 1.0) / 2.0, -1.0, 1.0))
+                        misor_list.append(float(np.degrees(np.arccos(cos_a))))
+                    avg_misor = float(np.mean(misor_list)) if misor_list else 0.0
 
             tex_idx = compute_texture_index(ea)
 

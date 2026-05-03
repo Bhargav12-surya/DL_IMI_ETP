@@ -21,11 +21,21 @@ venv/
 Thumbs.db
 .DS_Store
 
-# Logs
+# Logs — keep CSV logs, ignore binary TensorBoard events and per-run logs
 *.log
+logs/**/tensorboard/
 
-# Model weights & checkpoints (large files)
+# Model weights & checkpoints (large binary files)
+checkpoints/
+outputs/
+*.keras
+*.h5
 *.pt
 *.pth
 *.onnx
+*.npy
+*.pkl
 runs/
+
+# Scratch / temp files
+scratch/
