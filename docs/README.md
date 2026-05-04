@@ -410,3 +410,34 @@ The API augments DL model outputs with physics-based derived properties:
 ## License
 
 This project is for research and educational purposes. Dataset sourced from Dryad under CC0 public domain dedication.
+
+
+---
+
+## Exhaustive Project Specifications
+
+### 1. Theoretical DL/ML Framework
+The IMI Framework employs a multi-branch, multi-scale learning strategy:
+*   **Branch 1: ResNet50 (Microstructure):** Focuses on local spatial hierarchies, extracting morphological features from 224x224 RGB EBSD images. The backbone is pre-trained on ImageNet, utilizing a Squeeze-and-Excitation (SE) block (ratio=8) post-GAP to recalibrate channel-wise feature responses dynamically.
+*   **Branch 2: MobileNetV2 (Texture):** Ingests auto-generated stereographic pole figures ({100}, {110}, {111}). The inverted residual structure of MobileNetV2 extracts orientation density data efficiently, focusing on global crystallographic texture matrices.
+*   **Branch 3: CGCNN (Atomic/Grain Graph):** Represents the microstructure as a topological graph. Nodes are individual grains with features `[phi1, Phi, phi2, normalized_volume, phase_id]`. Edges are grain boundaries with features `[misorientation_angle, shared_area_proxy]`. Uses 4 Message-Passing Convolution (CGCNNConv) layers to capture neighborhood interactions.
+*   **Fusion Layer:** A deterministic concatenation of 3 x 256-d embeddings into a 768-d tensor, followed by a multi-layer perceptron (MLP) mapping to macro-properties, utilizing Huber loss (delta=1.0) for robust regression.
+
+### 2. Input and Output Matrix
+#### Inputs
+*   **Data Type:** .h5 raw EBSD data (containing `euler`, `grains`, `phases`) and .tiff/.png 2D slices.
+*   **Preprocessing:** EBSD files are processed by `data_utils.py` to generate bounding box images and pole figures using spherical projections.
+*   **Synthetic Test Data:** 51 synthetic testing sets (h5 + images) generated via `generate_test_data.py` for rapid inference checks.
+
+#### Outputs
+*   **Primary Predictions:** `grain_size` (µm), `texture_index` (J-index), `avg_misorientation` (degrees).
+*   **Physics-Augmented Predictions:**
+    *   **Yield Strength (sigma_y):** via Hall-Petch relation (sigma_y = sigma_0 + k_y / sqrt(d))
+    *   **Hardness (HV):** Tabor relation (HV approx 3 * sigma_y)
+    *   **Elastic/Bulk Modulus:** Rule of mixtures and baseline offsets.
+    *   **Dislocation Density:** Derived via Nye tensor misorientation gradients.
+
+### 3. Training Protocol & Hyperparameters
+*   **Two-Phase Training:** Phase 1 (Warmup) freezes backbones with LR=1e-3 for 10 epochs. Phase 2 (Fine-tuning) unfreezes the top 50% layers with Cosine Decay LR=5e-5 for 60-70 epochs.
+*   **Optimization:** AdamW optimizer with weight decay (1e-4) and gradient clipping (1.0).
+*   **Memory Efficiency:** Uses Mixed Precision (FP16) and Gradient Accumulation (4 steps over batch size 16-32) to simulate large batches on standard hardware.

@@ -1266,3 +1266,86 @@ If the fusion model isn't loaded, the API falls back to **weighted averaging** o
 | Grain size | < 2 µm | > 0.85 |
 | Texture index | < 0.15 | > 0.80 |
 | Avg misorientation | < 0.5° | > 0.82 |
+
+
+---
+
+## 19. Advanced DL Theory & Pipeline Internals
+The core of this predictive engine relies on the synergy of convolution and message-passing mechanisms:
+*   **Huber Loss Justification:** Instead of standard MSE, Multi-Output Huber Loss is used because raw EBSD data often contains extreme outliers (e.g., severe localized misorientation due to deformation). Huber loss prevents these outliers from skewing the gradient.
+*   **MixUp Augmentation:** Implemented in the image branches using a Beta(0.2, 0.2) distribution. This forces the model to interpolate between microstructures, creating a smoother latent space and regularizing against overfitting on small datasets.
+*   **SE Blocks (Squeeze-and-Excitation):** Integrated after the GAP (Global Average Pooling) in both CNN branches to learn channel weights. If a specific filter detects "twinned boundaries", the SE block amplifies this channel before passing it to the Fusion Layer.
+
+## 20. Exhaustive Hyperparameters & Constraints
+*   **ResNet/MobileNet Config:** Input size (224,224,3), embedding size 256, Dropout 0.35-0.40, L2 Regularization 1e-4.
+*   **CGCNN Config:** Hidden dim 64, 4 Conv layers, Max Nodes 512, Max Edges 4096 (padded for uniform tensor sizes).
+*   **Batch & Learning:**
+    *   Batch Size: 32 (Images), 16 (Graphs)
+    *   Grad Accum Steps: 4 (Effective batch sizes: 128 and 64).
+    *   Warmup Epochs: 10, Finetune Epochs: 60-70.
+
+## 21. Physics-Informed Derivations Explained
+The API (`app.py`) intercepts the pure DL outputs and applies domain physics:
+*   **Hall-Petch Equation:** `yield_strength = 200 + 400 / sqrt(grain_size + 1e-5)`.
+*   **Tabor's Empirical Rule:** `hardness = yield_strength / 3.0`.
+*   **Nye Tensor Approximation:** `dislocation_density = (avg_misorientation / 100) * 1e14 + 1e12`.
+This allows the framework to extrapolate un-labeled thermodynamic and mechanical properties strictly from microstructural geometry.
+
+## 22. Detailed File Architecture Reference
+*   **`backend/app.py`**: The central nervous system. Loads all models via `ModelRegistry`. Features fallback inference logic (if CGCNN fails, ResNet+MobileNet carry the prediction). Provides endpoints `/api/predict` and `/api/synthetic-test`.
+*   **`data_utils.py`**: The data refinery. Calculates Euler angles to generate stereographic pole-figures. Constructs PyTorch-Geometric style graphs (Nodes=grains, Edges=boundaries) natively in NumPy to feed TF Data API.
+*   **`train_fusion_layer.py`**: Trains the final MLP. Supports "offline" mode (using pre-generated `.npy` embeddings for speed) and "online" mode (end-to-end backprop).
+
+
+---
+
+## 23. Exhaustive Material Property Theory & Derivations
+The IMI pipeline predicts an extensive array of physical and mechanical properties from pure microstructural imaging data. Below is the exhaustive theoretical foundation for each property tracked and predicted by the system.
+
+### 23.1 Grain Size (µm)
+*   **Definition:** The average equivalent diameter of individual crystallites (grains) within the polycrystalline matrix.
+*   **DL Theory / Source:** Learned directly by the ResNet50 (Branch 1) from 2D morphology and bounding-box spatial features, and indirectly from the CGCNN (Branch 3) node features (normalized volume).
+*   **Physical Significance:** Governs the mechanical strength of the material. Smaller grains restrict dislocation movement, making the metal harder and stronger.
+
+### 23.2 Texture Index (J-index)
+*   **Definition:** A scalar metric indicating the sharpness or strength of the crystallographic preferred orientation (texture) in the material. A value of 1.0 implies a completely random orientation (isotropic), while higher values indicate strong texture (anisotropic).
+*   **Mathematical Foundation:** It is the integral of the squared Orientation Distribution Function (ODF): $J = \int |f(g)|^2 dg$.
+*   **DL Theory / Source:** Learned dominantly by MobileNetV2 (Branch 2) from the auto-generated {100}, {110}, and {111} pole figures. The network learns the concentration and spread of poles to map to the J-index.
+
+### 23.3 Average Misorientation (Degrees)
+*   **Definition:** The mean angle of disorientation between adjacent grains across the entire microstructure.
+*   **Mathematical Foundation:** Calculated as the minimum rotation angle required to bring the crystal lattices of two adjacent grains into coincidence, accounting for crystal symmetry matrices.
+*   **DL Theory / Source:** Captured directly by CGCNN (Branch 3). The edge features of the graph explicitly encode the misorientation angle ($\Delta 	heta$). The GNN aggregates this topology to predict the bulk average misorientation.
+
+### 23.4 Yield Strength ($\sigma_y$) in MPa
+*   **Definition:** The stress at which a material begins to deform plastically. Prior to the yield point, the material will deform elastically and will return to its original shape when the applied stress is removed.
+*   **Physics-Informed Derivation:** Hall-Petch Equation.
+    *   $\sigma_y = \sigma_0 + rac{k_y}{\sqrt{d}}$
+    *   where $\sigma_0$ is the friction stress (inherent resistance of the lattice to dislocation motion), $k_y$ is the strengthening coefficient (material-specific), and $d$ is the predicted grain size.
+*   **Pipeline Logic:** The API intercepts the DL-predicted `grain_size` and dynamically calculates the Yield Strength, allowing the model to bridge the gap between pure computer vision and metallurgical mechanics.
+
+### 23.5 Hardness (HV - Vickers Hardness)
+*   **Definition:** The measure of the resistance of a localized surface to deformation, typically by indentation.
+*   **Physics-Informed Derivation:** Tabor's Empirical Rule.
+    *   $HV pprox C \cdot \sigma_y$ (where $C pprox 3.0$ for many metals).
+*   **Pipeline Logic:** Derived linearly from the Hall-Petch Yield Strength calculation, demonstrating how cascaded physical derivations expand the predictive capability of the initial neural network output.
+
+### 23.6 Elastic Modulus (E) in GPa
+*   **Definition:** A quantity that measures an object or substance's resistance to being deformed elastically when a stress is applied to it (stiffness).
+*   **DL & Physics Synergy:** While heavily dependent on the material phase and bonding, texture (crystallographic orientation) causes macroscopic anisotropy in stiffness. The Fusion Layer learns the offset and bounds of the Elastic Modulus influenced by the Texture Index (Branch 2).
+
+### 23.7 Bulk Modulus (K) in GPa
+*   **Definition:** Measures the substance's resistance to uniform compression.
+*   **Physics-Informed Derivation:** Isotropic elastic relations.
+    *   $K = rac{E}{3(1 - 2
+u)}$
+    *   where $E$ is the Elastic Modulus and $
+u$ is Poisson's ratio (assumed standard range for metallic matrices).
+
+### 23.8 Dislocation Density ($ho$) in m⁻²
+*   **Definition:** The total length of dislocation lines per unit volume. It is a fundamental parameter defining the strain-hardened state of a metal.
+*   **Physics-Informed Derivation:** Nye Tensor Approximation.
+    *   Geometrically Necessary Dislocations (GNDs) can be estimated from local lattice curvature (misorientation gradients).
+    *   $ho_{GND} \propto rac{\Delta 	heta}{b \cdot x}$
+    *   where $\Delta 	heta$ is the misorientation angle (predicted by DL) and $b$ is the Burgers vector.
+*   **Pipeline Logic:** The API uses a linearized proxy mapping the DL-predicted `avg_misorientation` to an exponential scalar representing baseline GND accumulation.
