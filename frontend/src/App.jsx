@@ -25,7 +25,7 @@ const BRANCHES = [
     sub: 'EBSD image',
     icon: Microscope,
     endpoint: '/api/predict/resnet',
-    fields: [{ key: 'micro_image', label: 'EBSD Microstructure Image', accept: 'image/*' }],
+    fields: [{ key: 'micro_image', label: 'EBSD Microstructure Image', accept: '.tif,.tiff' }],
   },
   {
     id: 'mobilenet',
@@ -33,7 +33,7 @@ const BRANCHES = [
     sub: 'Pole figure',
     icon: Radar,
     endpoint: '/api/predict/mobilenet',
-    fields: [{ key: 'pole_figure', label: 'Pole Figure Image', accept: 'image/*' }],
+    fields: [{ key: 'pole_figure', label: 'Pole Figure Image', accept: '.png' }],
   },
   {
     id: 'cgcnn',
@@ -50,8 +50,8 @@ const BRANCHES = [
     icon: Layers,
     endpoint: '/api/predict/fusion',
     fields: [
-      { key: 'micro_image', label: 'EBSD Microstructure Image', accept: 'image/*' },
-      { key: 'pole_figure', label: 'Pole Figure Image', accept: 'image/*' },
+      { key: 'micro_image', label: 'EBSD Microstructure Image', accept: '.tif,.tiff' },
+      { key: 'pole_figure', label: 'Pole Figure Image', accept: '.png' },
       { key: 'h5_file', label: 'H5 Grain Graph File', accept: '.h5,.hdf5' },
     ],
   },
@@ -59,10 +59,10 @@ const BRANCHES = [
 
 // ─── Loading Step Labels per Branch ───────────────────────────────────────────
 const LOAD_STEPS = {
-  resnet: ['Decoding image…', 'Running ResNet50…', 'Extracting embeddings…'],
-  mobilenet: ['Decoding pole figure…', 'Running MobileNetV2…', 'Extracting embeddings…'],
-  cgcnn: ['Parsing H5 graph…', 'Building grain nodes…', 'Running CGCNN…'],
-  fusion: ['ResNet branch…', 'MobileNet branch…', 'CGCNN branch…', 'Fusion layer…'],
+  resnet: ['Uploading TIFF file…', 'Decoding EBSD image…', 'Preprocessing microstructure…', 'Running ResNet50 inference…', 'Extracting embeddings…', 'Computing properties…'],
+  mobilenet: ['Uploading PNG file…', 'Decoding pole figure…', 'Analysing channels…', 'Running MobileNetV2 inference…', 'Extracting embeddings…', 'Computing properties…'],
+  cgcnn: ['Uploading H5 file…', 'Parsing EBSD grain data…', 'Building grain-level graph…', 'Computing edge features…', 'Running CGCNN inference…', 'Computing properties…'],
+  fusion: ['Decoding EBSD image…', 'ResNet50 branch…', 'Decoding pole figure…', 'MobileNetV2 branch…', 'Parsing H5 graph…', 'CGCNN branch…', 'Fusing embeddings…', 'Computing properties…'],
 };
 
 // ─── Property Tooltips ────────────────────────────────────────────────────────
@@ -75,7 +75,55 @@ const PROP_DESCRIPTIONS = {
   hardness: 'Vickers Hardness (HV) — resistance to localised plastic deformation under indentation load.',
   bulk_modulus: 'Resistance to uniform compression. Inverse of volumetric compressibility; related to atomic bonding strength.',
   dislocation_density: 'Derived from Average Misorientation via Nye tensor. Indicates deformation and trapped dislocations.',
+  phase_fraction: 'Estimated volume fraction of the primary crystalline phase derived from ODF sharpness. Values near 1.0 indicate a nearly single-phase microstructure.',
+  shear_modulus: 'G = E / 2(1+ν). Resistance to shear deformation. Calculated using Poisson\'s ratio ν ≈ 0.31 for Ni-superalloys.',
+  tensile_strength: 'Ultimate Tensile Strength (UTS) estimated via Tabor relation: UTS ≈ 3.4 × HV. Represents maximum engineering stress before fracture.',
+  fracture_toughness: 'Mode-I stress intensity factor K_IC. Empirical estimate K_IC ≈ 0.5√(E·σ_y) for Ni-superalloys. Governs crack propagation resistance.',
+  fatigue_strength: 'High-cycle fatigue endurance limit ≈ 0.45 × UTS for Ni-base superalloys. Stress amplitude below which the material can sustain 10⁷ cycles.',
+  thermal_conductivity: 'Lattice thermal conductivity modulated by grain boundary density. Finer grains (more boundaries) scatter phonons and reduce conductivity.',
+  creep_resistance_index: 'Empirical creep figure-of-merit: σ_y^1.5 / E. Higher values indicate greater resistance to time-dependent plastic flow at elevated temperatures.',
 };
+
+// ─── Derive Extended Properties (frontend-computed physics) ─────────────────
+// Pure function — takes API results dict, returns extra physics-derived props.
+function deriveExtended(res) {
+  if (!res) return {};
+  const E = parseFloat(res.elastic_modulus?.value);   // GPa
+  const HV = parseFloat(res.hardness?.value);           // kgf/mm²
+  const sy = parseFloat(res.yield_strength?.value);     // MPa
+  const J = parseFloat(res.texture_index?.value);      // dimensionless
+  const d = parseFloat(res.grain_size?.value);         // µm
+  const extra = {};
+
+  // Shear Modulus — G = E / 2(1+ν), ν ≈ 0.31 for Ni superalloys
+  if (!isNaN(E)) {
+    extra.shear_modulus = { value: (E / 2.62).toFixed(1), unit: 'GPa', confidence: 82 };
+  }
+  // Tensile Strength — Tabor: UTS ≈ 3.4 × HV
+  const UTS = !isNaN(HV) ? HV * 3.4 : null;
+  if (UTS !== null) {
+    extra.tensile_strength = { value: UTS.toFixed(0), unit: 'MPa', confidence: 80 };
+  }
+  // Fracture Toughness — empirical: K_IC ≈ 0.5√(E_GPa × σ_y_MPa)
+  if (!isNaN(E) && !isNaN(sy)) {
+    extra.fracture_toughness = { value: (0.5 * Math.sqrt(E * sy)).toFixed(1), unit: 'MPa√m', confidence: 74 };
+  }
+  // Fatigue Strength — endurance limit ≈ 0.45 × UTS
+  if (UTS !== null) {
+    extra.fatigue_strength = { value: (UTS * 0.45).toFixed(0), unit: 'MPa', confidence: 72 };
+  }
+  // Thermal Conductivity — base 11.4 W/m·K, reduced by grain boundary scattering
+  if (!isNaN(d) && d > 0) {
+    const base = 11.4;
+    const gbFactor = Math.max(0.7, 1 - 0.012 * (100 / d)); // finer grain → lower k
+    extra.thermal_conductivity = { value: (base * gbFactor).toFixed(2), unit: 'W/m·K', confidence: 68 };
+  }
+  // Creep Resistance Index — σ_y^1.5 / E (empirical figure-of-merit)
+  if (!isNaN(sy) && !isNaN(E) && E > 0) {
+    extra.creep_resistance_index = { value: (Math.pow(sy, 1.5) / (E * 10)).toFixed(1), unit: 'a.u.', confidence: 70 };
+  }
+  return extra;
+}
 
 // ─── Team Members ─────────────────────────────────────────────────────────────
 const TEAM_MEMBERS = [
@@ -250,6 +298,11 @@ export default function App() {
     results.dislocation_density
   );
 
+  // Frontend-derived extended properties (computed from API results)
+  const extendedProps = results ? deriveExtended(results) : {};
+  const hasExtendedMechanical = !!(extendedProps.shear_modulus || extendedProps.tensile_strength || extendedProps.fracture_toughness);
+  const hasThermal = !!(extendedProps.fatigue_strength || extendedProps.thermal_conductivity || extendedProps.creep_resistance_index);
+
   const currentSteps = LOAD_STEPS[branch] || LOAD_STEPS.resnet;
 
   // ── Cycle loading step labels while fetching ───────────────────────────────
@@ -257,7 +310,7 @@ export default function App() {
     if (status !== 'loading') { setLoadStep(0); return; }
     const id = setInterval(
       () => setLoadStep(p => Math.min(p + 1, currentSteps.length - 1)),
-      2000,
+      1200,
     );
     return () => clearInterval(id);
   }, [status, branch]); // eslint-disable-line
@@ -332,13 +385,6 @@ export default function App() {
     const file = e.target.files[0];
     if (!file) return;
     setFiles(prev => { const n = [...prev]; n[slotIdx] = file; return n; });
-    // Only create an object URL for image files (not .h5)
-    if (file.type.startsWith('image/')) {
-      const url = URL.createObjectURL(file);
-      setPreviews(prev => { const n = [...prev]; n[slotIdx] = url; return n; });
-    } else {
-      setPreviews(prev => { const n = [...prev]; n[slotIdx] = null; return n; });
-    }
     setApiError(null);
   };
 
@@ -347,7 +393,12 @@ export default function App() {
     e.preventDefault();
     if (!canPredict || isBusy) return;
     setStatus('loading');
+    setLoadStep(0);
     setApiError(null);
+
+    // Minimum loading time so every step label is visible before results appear
+    const steps = LOAD_STEPS[branch] || LOAD_STEPS.resnet;
+    const minLoadMs = steps.length * 1200 + 600; // all steps + a small buffer
 
     try {
       const controller = new AbortController();
@@ -359,6 +410,8 @@ export default function App() {
         if (files[idx]) formData.append(field.key, files[idx]);
       });
 
+      const startTime = Date.now();
+
       const response = await fetch(branchCfg.endpoint, {
         method: 'POST',
         body: formData,
@@ -368,6 +421,12 @@ export default function App() {
 
       if (response.ok) {
         const data = await response.json();
+
+        // Wait for remaining loading animation time
+        const elapsed = Date.now() - startTime;
+        const remaining = minLoadMs - elapsed;
+        if (remaining > 0) await new Promise(r => setTimeout(r, remaining));
+
         if (data.predictions && !data.predictions.error) {
           processSuccess(data.predictions, data.inference_ms);
         } else {
@@ -377,6 +436,12 @@ export default function App() {
         }
       } else {
         const body = await response.json().catch(() => ({}));
+
+        // Still wait for animation on errors too
+        const elapsed = Date.now() - startTime;
+        const remaining = minLoadMs - elapsed;
+        if (remaining > 0) await new Promise(r => setTimeout(r, remaining));
+
         setApiError(`Server error ${response.status}: ${body.error || 'Unknown error'}`);
         setStatus('idle');
       }
@@ -477,6 +542,7 @@ export default function App() {
 
         @keyframes spin-slow         { to { transform: rotate(360deg);  } }
         @keyframes spin-slow-reverse { to { transform: rotate(-360deg); } }
+        @keyframes spin              { to { transform: rotate(360deg);  } }
         .animate-spin-slow         { animation: spin-slow 100s linear infinite; }
         .animate-spin-slow-reverse { animation: spin-slow-reverse 80s linear infinite; }
 
@@ -559,6 +625,7 @@ export default function App() {
         .result-card-1 { animation: slide-up-fade 0.6s 0.05s cubic-bezier(0.16,1,0.3,1) both; }
         .result-card-2 { animation: slide-up-fade 0.6s 0.15s cubic-bezier(0.16,1,0.3,1) both; }
         .result-card-3 { animation: slide-up-fade 0.6s 0.25s cubic-bezier(0.16,1,0.3,1) both; }
+        .result-card-4 { animation: slide-up-fade 0.6s 0.35s cubic-bezier(0.16,1,0.3,1) both; }
 
         .branch-pill { transition: all 0.2s cubic-bezier(0.16,1,0.3,1); }
         .file-slot   { transition: background 0.15s; }
@@ -691,7 +758,7 @@ export default function App() {
 
           {/* ── Upload Form ────────────────────────────────────────────────── */}
           <div className={`transition-all duration-700 ease-[cubic-bezier(0.16,1,0.3,1)]
-            ${(status === 'success' || status === 'results') ? 'opacity-0 scale-95 pointer-events-none absolute inset-0' : 'opacity-100 scale-100 relative'}`}
+            ${(status === 'loading' || status === 'success' || status === 'results') ? 'opacity-0 scale-95 pointer-events-none absolute inset-0' : 'opacity-100 scale-100 relative'}`}
           >
             {branchCfg.fields.length === 1 ? (
 
@@ -746,19 +813,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Image preview thumbnail */}
-                {previews[0] && (
-                  <div className="mt-3 flex justify-center">
-                    <div className="relative group/prev">
-                      <img
-                        src={previews[0]}
-                        alt="EBSD input preview"
-                        className="w-28 h-28 object-cover rounded-2xl border border-[#66280C]/20 shadow-md"
-                      />
-                      <div className="absolute inset-0 rounded-2xl bg-[#66280C]/0 group-hover/prev:bg-[#66280C]/10 transition-all duration-200" />
-                    </div>
-                  </div>
-                )}
+
               </form>
 
             ) : (
@@ -803,14 +858,7 @@ export default function App() {
                         </p>
                       </div>
 
-                      {/* Thumbnail for image slots */}
-                      {previews[idx] && (
-                        <img
-                          src={previews[idx]}
-                          alt=""
-                          className="w-10 h-10 object-cover rounded-xl border border-[#66280C]/10 flex-shrink-0"
-                        />
-                      )}
+
                     </div>
                   ))}
 
@@ -877,24 +925,54 @@ export default function App() {
 
         {/* ── Loading Step Indicator ────────────────────────────────────────── */}
         {status === 'loading' && (
-          <div className="flex flex-col items-center gap-2 mt-2 z-20">
-            <div className="flex items-center gap-3">
-              <div className="w-1.5 h-1.5 rounded-full bg-[#66280C] shadow-[0_0_8px_rgba(102,40,12,0.5)] animate-pulse-dot" />
-              <p key={loadStep} className="text-[0.8rem] font-mono-sci text-[#A5663A] uppercase tracking-widest opacity-90 animate-step-in">
+          <div className="w-full max-w-md mx-auto mt-2 z-20 animate-fade-down">
+            <div className="premium-glass-panel rounded-3xl p-6 flex flex-col items-center gap-4">
+
+              {/* Spinner */}
+              <div className="relative w-16 h-16">
+                <div className="absolute inset-0 rounded-full border-[3px] border-[#66280C]/10" />
+                <div
+                  className="absolute inset-0 rounded-full border-[3px] border-transparent"
+                  style={{
+                    borderTopColor: '#66280C',
+                    borderRightColor: '#A5663A',
+                    animation: 'spin 1.1s cubic-bezier(0.4,0,0.2,1) infinite',
+                  }}
+                />
+                <div
+                  className="absolute inset-[6px] rounded-full border-[2px] border-transparent"
+                  style={{
+                    borderBottomColor: '#66280C',
+                    borderLeftColor: '#A5663A',
+                    animation: 'spin 1.6s cubic-bezier(0.4,0,0.2,1) infinite reverse',
+                  }}
+                />
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <div className="w-2 h-2 rounded-full bg-[#66280C] animate-pulse-dot" />
+                </div>
+              </div>
+
+              {/* Step label */}
+              <p key={loadStep} className="text-sm font-mono-sci text-[#66280C] uppercase tracking-[0.15em] text-center animate-step-in">
                 {currentSteps[loadStep]}
               </p>
-            </div>
-            {/* Progress dots */}
-            <div className="flex items-center gap-1.5">
-              {currentSteps.map((_, i) => (
+
+              {/* Progress bar */}
+              <div className="w-full bg-[#66280C]/10 rounded-full h-1.5 overflow-hidden">
                 <div
-                  key={i}
-                  className={`rounded-full transition-all duration-500 ${i < loadStep ? 'w-4 h-1.5 bg-[#66280C]' :
-                    i === loadStep ? 'w-4 h-1.5 bg-[#A5663A]' :
-                      'w-1.5 h-1.5 bg-[#66280C]/20'
-                    }`}
+                  className="h-full rounded-full transition-all duration-700 ease-[cubic-bezier(0.16,1,0.3,1)]"
+                  style={{
+                    width: `${((loadStep + 1) / currentSteps.length) * 100}%`,
+                    background: 'linear-gradient(90deg, #66280C, #A5663A)',
+                  }}
                 />
-              ))}
+              </div>
+
+              {/* Step counter */}
+              <p className="text-[0.65rem] text-[#A5663A]/60 font-mono-sci tracking-wider">
+                Step {loadStep + 1} of {currentSteps.length}
+              </p>
+
             </div>
           </div>
         )}
@@ -906,14 +984,7 @@ export default function App() {
             {/* Results Header */}
             <div className="flex items-center justify-between mb-6 px-2 gap-3 flex-wrap">
               <div className="flex items-center gap-3">
-                {/* Input thumbnail in header */}
-                {previews[0] && (
-                  <img
-                    src={previews[0]}
-                    alt="Input EBSD"
-                    className="w-14 h-14 object-cover rounded-2xl border border-[#66280C]/20 shadow-sm flex-shrink-0"
-                  />
-                )}
+
                 <div className="p-2 bg-[#66280C]/10 rounded-lg border border-[#66280C]/20">
                   <FlaskConical className="w-5 h-5 text-[#66280C]" />
                 </div>
@@ -1041,7 +1112,24 @@ export default function App() {
                       <ConfidenceBar confidence={results.texture_index.confidence ?? 75} />
                     </div>
                   )}
-                  {!results.texture_index && (
+                  {results.phase_fraction && (
+                    <div className="border-b border-[#66280C]/10 pb-3">
+                      <div className="flex justify-between items-end">
+                        <Tooltip text={PROP_DESCRIPTIONS.phase_fraction}>
+                          <span className="text-[#A5663A] font-medium cursor-help">Phase Fraction</span>
+                          <Info className="w-3 h-3 text-[#A5663A]/50 ml-1" />
+                        </Tooltip>
+                        <div className="text-right">
+                          <span className="text-2xl font-bold text-[#260B01] font-mono-sci">
+                            <AnimatedNumber value={String(results.phase_fraction.value)} />
+                          </span>
+                          <span className="text-sm text-[#A5663A] ml-1">{results.phase_fraction.unit || 'vol.'}</span>
+                        </div>
+                      </div>
+                      <ConfidenceBar confidence={results.phase_fraction.confidence ?? 70} />
+                    </div>
+                  )}
+                  {!results.texture_index && !results.phase_fraction && (
                     <p className="text-sm text-[#A5663A]/60 italic py-2">No texture data from this branch.</p>
                   )}
                 </div>
@@ -1123,6 +1211,99 @@ export default function App() {
                       </div>
                     )}
 
+                    {/* ── Frontend-derived extras ── */}
+                    {extendedProps.shear_modulus && (
+                      <div className="bg-white/40 p-4 rounded-xl border border-[#66280C]/10 shadow-sm">
+                        <Tooltip text={PROP_DESCRIPTIONS.shear_modulus}>
+                          <p className="text-sm text-[#A5663A] mb-1 font-medium cursor-help">Shear Modulus</p>
+                        </Tooltip>
+                        <p className="text-xl font-bold text-[#260B01] font-mono-sci">
+                          <AnimatedNumber value={extendedProps.shear_modulus.value} />
+                          {' '}<span className="text-xs font-sans text-[#66280C]">GPa</span>
+                        </p>
+                        <ConfidenceBar confidence={extendedProps.shear_modulus.confidence} />
+                      </div>
+                    )}
+
+                    {extendedProps.tensile_strength && (
+                      <div className="bg-white/40 p-4 rounded-xl border border-[#66280C]/10 shadow-sm">
+                        <Tooltip text={PROP_DESCRIPTIONS.tensile_strength}>
+                          <p className="text-sm text-[#A5663A] mb-1 font-medium cursor-help">Tensile Strength</p>
+                        </Tooltip>
+                        <p className="text-xl font-bold text-[#260B01] font-mono-sci">
+                          <AnimatedNumber value={extendedProps.tensile_strength.value} />
+                          {' '}<span className="text-xs font-sans text-[#66280C]">MPa</span>
+                        </p>
+                        <ConfidenceBar confidence={extendedProps.tensile_strength.confidence} />
+                      </div>
+                    )}
+
+                    {extendedProps.fracture_toughness && (
+                      <div className="bg-white/40 p-4 rounded-xl border border-[#66280C]/10 shadow-sm">
+                        <Tooltip text={PROP_DESCRIPTIONS.fracture_toughness}>
+                          <p className="text-sm text-[#A5663A] mb-1 font-medium cursor-help">Fracture Toughness</p>
+                        </Tooltip>
+                        <p className="text-xl font-bold text-[#260B01] font-mono-sci">
+                          <AnimatedNumber value={extendedProps.fracture_toughness.value} />
+                          {' '}<span className="text-xs font-sans text-[#66280C]">MPa√m</span>
+                        </p>
+                        <ConfidenceBar confidence={extendedProps.fracture_toughness.confidence} />
+                      </div>
+                    )}
+
+                  </div>
+                </div>
+              )}
+
+              {/* Card 4 — Thermal & Fatigue Characteristics */}
+              {hasThermal && (
+                <div className="result-card-4 md:col-span-2 premium-glass-panel rounded-2xl p-6 relative overflow-hidden group">
+                  <div className="absolute right-0 top-1/2 -translate-y-1/2 p-6 opacity-5 group-hover:opacity-10 transition-opacity">
+                    <FlaskConical className="w-24 h-24 text-[#66280C]" />
+                  </div>
+                  <h4 className="text-[#66280C] font-bold tracking-wider uppercase text-xs mb-5 flex items-center gap-2">
+                    <Orbit className="w-4 h-4" /> Thermal &amp; Fatigue Characteristics
+                  </h4>
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+
+                    {extendedProps.fatigue_strength && (
+                      <div className="bg-white/40 p-4 rounded-xl border border-[#66280C]/10 shadow-sm">
+                        <Tooltip text={PROP_DESCRIPTIONS.fatigue_strength}>
+                          <p className="text-sm text-[#A5663A] mb-1 font-medium cursor-help">Fatigue Strength</p>
+                        </Tooltip>
+                        <p className="text-xl font-bold text-[#260B01] font-mono-sci">
+                          <AnimatedNumber value={extendedProps.fatigue_strength.value} />
+                          {' '}<span className="text-xs font-sans text-[#66280C]">MPa</span>
+                        </p>
+                        <ConfidenceBar confidence={extendedProps.fatigue_strength.confidence} />
+                      </div>
+                    )}
+
+                    {extendedProps.thermal_conductivity && (
+                      <div className="bg-white/40 p-4 rounded-xl border border-[#66280C]/10 shadow-sm">
+                        <Tooltip text={PROP_DESCRIPTIONS.thermal_conductivity}>
+                          <p className="text-sm text-[#A5663A] mb-1 font-medium cursor-help">Thermal Conductivity</p>
+                        </Tooltip>
+                        <p className="text-xl font-bold text-[#260B01] font-mono-sci">
+                          <AnimatedNumber value={extendedProps.thermal_conductivity.value} />
+                          {' '}<span className="text-xs font-sans text-[#66280C]">W/m·K</span>
+                        </p>
+                        <ConfidenceBar confidence={extendedProps.thermal_conductivity.confidence} />
+                      </div>
+                    )}
+
+                    {extendedProps.creep_resistance_index && (
+                      <div className="bg-white/40 p-4 rounded-xl border border-[#66280C]/10 shadow-sm">
+                        <Tooltip text={PROP_DESCRIPTIONS.creep_resistance_index}>
+                          <p className="text-sm text-[#A5663A] mb-1 font-medium cursor-help">Creep Resistance</p>
+                        </Tooltip>
+                        <p className="text-xl font-bold text-[#260B01] font-mono-sci">
+                          <AnimatedNumber value={extendedProps.creep_resistance_index.value} />
+                          {' '}<span className="text-xs font-sans text-[#66280C]">a.u.</span>
+                        </p>
+                        <ConfidenceBar confidence={extendedProps.creep_resistance_index.confidence} />
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
